@@ -12,6 +12,7 @@ class InterviewStartRequest(BaseModel):
     resumeContext: dict
     candidateName: str = "Candidate"
     jobRole: str = "Software Engineer"
+    token: Optional[str] = None
 
 
 class InterviewAnswerRequest(BaseModel):

@@ -418,6 +418,7 @@ async def start_interview(request: InterviewStartRequest):
         session_id = str(uuid.uuid4())
         ACTIVE_INTERVIEWS[session_id] = {
             "candidateName": request.candidateName,
+            "token": request.token,
             "jobRole": request.jobRole,
             "resumeContext": request.resumeContext,
             "questions": questions,
@@ -527,6 +528,7 @@ async def start_interview(request: InterviewStartRequest):
         session_id = str(uuid.uuid4())
         ACTIVE_INTERVIEWS[session_id] = {
             "candidateName": request.candidateName,
+            "token": request.token,
             "jobRole": request.jobRole,
             "resumeContext": request.resumeContext,
             "questions": questions,
@@ -554,6 +556,9 @@ async def submit_answer(request: InterviewAnswerRequest):
     if not session:
         return {"error": "Session not found"}
         
+    if request.questionIndex != session.get("currentQuestionIndex", 0):
+        raise HTTPException(status_code=409, detail="Out-of-order answer submission.")
+
     current_time = time.time()
     time_taken = current_time - session["questionStartTime"]
     

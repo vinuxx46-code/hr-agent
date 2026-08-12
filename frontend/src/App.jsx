@@ -11,7 +11,7 @@ function App() {
         <div style={{ flex: 1 }}>
           <Routes>
             <Route path="/" element={<CandidatePortal />} />
-            <Route path="/interview" element={<CandidatePortal directQA={true} />} />
+            <Route path="/interview" element={<CandidatePortal />} />
             <Route path="/hr-dashboard" element={<HrDashboard />} />
           </Routes>
         </div>

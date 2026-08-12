@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import './index.css';
+import { apiUrl } from './api';
 
 function HrDashboard() {
   const [candidates, setCandidates] = useState([]);
@@ -14,7 +15,7 @@ function HrDashboard() {
     try {
       setEmailSending(true);
       setEmailStatus('');
-      const res = await fetch(`http://localhost:8000/api/hr/send-email/${token}`, {
+      const res = await fetch(`${apiUrl(`/api/hr/send-email/${token}`)}`, {
         method: 'POST'
       });
       const data = await res.json();
@@ -31,13 +32,13 @@ function HrDashboard() {
   };
 
   const downloadPdf = (token) => {
-    window.open(`http://localhost:8000/api/hr/download-pdf/${token}`, '_blank');
+    window.open(`${apiUrl(`/api/hr/download-pdf/${token}`)}`, '_blank');
   };
 
   const fetchCandidates = async () => {
     try {
       setLoading(true);
-      const res = await fetch('http://localhost:8000/api/hr/candidates');
+      const res = await fetch(apiUrl('/api/hr/candidates'));
       if (res.ok) {
         const data = await res.json();
         setCandidates(data.candidates || []);
@@ -357,7 +358,7 @@ function HrDashboard() {
                   🎥 Session Video Recording & Screen Capture
                 </h3>
                 <a
-                  href={`http://localhost:8000/recordings/${selectedCandidate.token}.webm`}
+                  href={`${apiUrl(`/recordings/${selectedCandidate.token}.webm`)}`}
                   target="_blank"
                   download={`Interview_Recording_${selectedCandidate.token}.webm`}
                   rel="noreferrer"
@@ -373,7 +374,7 @@ function HrDashboard() {
                     preload="metadata"
                     style={{ width: '100%', maxHeight: '400px', display: 'block' }}
                     onError={() => setVideoError(true)}
-                    src={`http://localhost:8000/recordings/${selectedCandidate.token}.webm`}>
+                    src={`${apiUrl(`/recordings/${selectedCandidate.token}.webm`)}`}>
                     Your browser does not support HTML5 video streaming.
                   </video>
                 </div>
@@ -383,7 +384,7 @@ function HrDashboard() {
                     📹 Video Recording stream location:
                     <br />
                     <code style={{ fontSize: '0.82rem', color: '#a5b4fc', wordBreak: 'break-all' }}>
-                      http://localhost:8000/recordings/{selectedCandidate.token}.webm
+                      /recordings/{selectedCandidate.token}.webm
                     </code>
                   </p>
                   <p style={{ color: 'rgba(255,255,255,0.4)', fontSize: '0.8rem', marginTop: '0.5rem' }}>

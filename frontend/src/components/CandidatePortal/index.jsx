@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import ReactDOM from 'react-dom';
 import { FaceLandmarker, ObjectDetector, HandLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 import '../../index.css';
+import { apiUrl } from '../../api';
 
 // Suppress verbose MediaPipe WebAssembly logs to clear the console
 const originalWarn = console.warn;
@@ -361,7 +362,7 @@ function CandidatePortal({ directQA = false }) {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const token = params.get('token');
-    const isDirectQA = directQA || params.get('qa') === 'true' || params.get('mode') === 'qa' || params.get('page') === 'qa' || params.get('directQA') === 'true';
+    const isDirectQA = import.meta.env.DEV && (directQA || params.get('qa') === 'true' || params.get('mode') === 'qa' || params.get('page') === 'qa' || params.get('directQA') === 'true');
 
     if (isDirectQA) {
       const mockCandidate = { name: "Test Candidate", skillsFound: ["Python", "React", "System Design"], matchPercentage: 100 };
@@ -389,7 +390,7 @@ function CandidatePortal({ directQA = false }) {
       validatedTokens.add(token);
       setInviteToken(token);
       // Validate token
-      fetch(`http://127.0.0.1:8000/api/validate-token/${token}`)
+      fetch(`${apiUrl(`/api/validate-token/${token}`)}`)
         .then(res => res.json())
         .then(data => {
           if (data.valid) {
@@ -612,7 +613,7 @@ function CandidatePortal({ directQA = false }) {
             // Validate 360-degree verification result and send proctoring events to backend server
             const activeToken = inviteToken || new URLSearchParams(window.location.search).get('token');
             if (activeToken) {
-              fetch(`http://127.0.0.1:8000/api/verify-360-scan/${activeToken}`, {
+              fetch(`${apiUrl(`/api/verify-360-scan/${activeToken}`)}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ proctoringEvents: proctoringEvents.current })
@@ -759,7 +760,7 @@ function CandidatePortal({ directQA = false }) {
       email: finalEmail
     };
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/hr/send-invites', {
+      const res = await fetch(apiUrl('/api/hr/send-invites'), {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ candidates: [candidateData], expiry_hours: 48 })
@@ -797,7 +798,7 @@ function CandidatePortal({ directQA = false }) {
     
     setIsSendingBulk(true);
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/hr/send-invites', {
+      const res = await fetch(apiUrl('/api/hr/send-invites'), {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ candidates: validShortlisted, expiry_hours: 48 })
@@ -830,7 +831,7 @@ function CandidatePortal({ directQA = false }) {
 
     try {
       const isZip = file.name.toLowerCase().endsWith('.zip');
-      const endpoint = isZip ? 'http://127.0.0.1:8000/api/bulk-upload' : 'http://127.0.0.1:8000/api/upload-resume';
+      const endpoint = isZip ? apiUrl('/api/bulk-upload') : apiUrl('/api/upload-resume');
       
       // The backend expects 'resume' for single upload, and 'file' for bulk upload
       const formData = new FormData();
@@ -884,7 +885,7 @@ function CandidatePortal({ directQA = false }) {
     // Send real-time event report to backend for HR audit logging
     const activeToken = inviteToken || new URLSearchParams(window.location.search).get('token');
     if (activeToken) {
-      fetch(`http://127.0.0.1:8000/api/log-proctoring-event/${activeToken}`, {
+      fetch(`${apiUrl(`/api/log-proctoring-event/${activeToken}`)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(eventObj)
@@ -1415,7 +1416,7 @@ function CandidatePortal({ directQA = false }) {
     // Immediately mark token as USED / EXPIRED on backend (Single-Use Token Enforcement)
     const activeToken = inviteToken || new URLSearchParams(window.location.search).get('token');
     if (activeToken) {
-      fetch(`http://127.0.0.1:8000/api/expire-token/${activeToken}`, { method: 'POST' }).catch(() => {});
+      fetch(`${apiUrl(`/api/expire-token/${activeToken}`)}`, { method: 'POST' }).catch(() => {});
     }
 
     sessionStorage.setItem('wasScanning', 'true');
@@ -1478,7 +1479,7 @@ function CandidatePortal({ directQA = false }) {
       }
 
       // Call Backend to generate customized questions in background
-      fetch('http://127.0.0.1:8000/api/interview/start', {
+      fetch(apiUrl('/api/interview/start'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1607,7 +1608,7 @@ function CandidatePortal({ directQA = false }) {
     }
 
     try {
-      const response = await fetch('http://127.0.0.1:8000/api/interview/answer', {
+      const response = await fetch(apiUrl('/api/interview/answer'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1640,8 +1641,15 @@ function CandidatePortal({ directQA = false }) {
         handleLocalAutoAdvance(currentQuestionIndex);
       }
     } catch (err) {
-      console.error("Submit answer error, auto-advancing to next question:", err);
-      handleLocalAutoAdvance(currentQuestionIndex);
+      // Never advance locally after a failed submission: that would lose the
+      // answer and produce an interview record the server cannot verify.
+      console.error("Secure answer submission failed:", err);
+      setIsSubmitting(false);
+      setCustomWarning({
+        show: true,
+        message: 'Your answer could not be securely saved. Check your connection and submit the same answer again.'
+      });
+      startQuestionTimer(Math.max(timeLeft, 5));
     }
   };
 
@@ -1695,7 +1703,7 @@ function CandidatePortal({ directQA = false }) {
       formData.append("video", videoBlob, "recording.webm");
       formData.append("proctoring_logs", JSON.stringify(proctoringEvents.current));
 
-      const response = await fetch(`http://127.0.0.1:8000/api/upload-interview-data/${inviteToken}`, {
+      const response = await fetch(`${apiUrl(`/api/upload-interview-data/${inviteToken}`)}`, {
         method: 'POST',
         body: formData
       });
@@ -2156,7 +2164,7 @@ function CandidatePortal({ directQA = false }) {
                   onClick={() => {
                     const activeToken = inviteToken || new URLSearchParams(window.location.search).get('token');
                     if (activeToken) {
-                      fetch(`http://127.0.0.1:8000/api/verify-360-scan/${activeToken}`, {
+                      fetch(`${apiUrl(`/api/verify-360-scan/${activeToken}`)}`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ proctoringEvents: proctoringEvents.current })

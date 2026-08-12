@@ -692,6 +692,7 @@ async def start_interview(request: InterviewStartRequest):
         session_id = str(uuid.uuid4())
         ACTIVE_INTERVIEWS[session_id] = {
             "candidateName": request.candidateName,
+            "token": request.token,
             "jobRole": request.jobRole,
             "resumeContext": request.resumeContext,
             "questions": questions,
@@ -784,6 +785,7 @@ async def start_interview(request: InterviewStartRequest):
         session_id = str(uuid.uuid4())
         ACTIVE_INTERVIEWS[session_id] = {
             "candidateName": request.candidateName,
+            "token": request.token,
             "jobRole": request.jobRole,
             "resumeContext": request.resumeContext,
             "questions": questions,
@@ -810,6 +812,18 @@ async def submit_answer(request: InterviewAnswerRequest):
     if not session:
         return {"error": "Session not found"}
         
+    # The browser is untrusted. Reject replayed, skipped, or reordered answers
+    # instead of allowing a caller to submit an answer for any question index.
+    if request.questionIndex != session.get("currentQuestionIndex", 0):
+        return {"error": "Out-of-order answer submission."}
+
+    session_token = session.get("token")
+    if session_token:
+        db = load_hr_db()
+        candidate = db.get("candidates", {}).get(session_token)
+        if not candidate or not candidate.get("scan_360_verified", False):
+            return {"error": "Room verification is required before answers can be submitted."}
+
     current_time = time.time()
     time_taken = current_time - session["questionStartTime"]
     

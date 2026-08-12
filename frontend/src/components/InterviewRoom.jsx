@@ -536,50 +536,79 @@ function CandidatePortal() {
         }
       }
 
-      // BACKGROUND VOICE DETECTION (LIP SYNC CORRELATION)
-      let isSpeakingAudio = false;
+      // BACKGROUND VOICE DETECTION - Noise-Ignoring Implementation
+      // Ignore ambient noise for multiple voice detection. Only confirmed speech API words count.
+      let isConfirmedHumanVoice = isHumanSpeechDetectedRef.current;
+      let ambientNoiseLevel = 0;
 
-      if (isHumanSpeechDetectedRef.current) {
-        isSpeakingAudio = true; // SpeechRecognition detected actual human words/voice
-      } else if (audioAnalyserRef.current && audioDataArrayRef.current) {
-        // Fallback strict acoustic check if SpeechRecognition is not supported
+      if (audioAnalyserRef.current && audioDataArrayRef.current) {
         audioAnalyserRef.current.getByteFrequencyData(audioDataArrayRef.current);
         let sum = 0;
         let count = 0;
-        // Much narrower focus to avoid broadband noise (e.g. 500Hz-2000Hz only)
         for (let i = 3; i < 15 && i < audioDataArrayRef.current.length; i++) {
           sum += audioDataArrayRef.current[i];
           count++;
         }
-        let average = count > 0 ? sum / count : 0;
-        // Very high threshold so random noise doesn't trigger it, only loud sustained sounds
-        if (average > 60) isSpeakingAudio = true;
+        ambientNoiseLevel = count > 0 ? sum / count : 0;
+        // Ambient noise explicitly ignored for background voice - only SpeechRecognition words count
       }
 
       let isMouthMoving = false;
       if (results.faceBlendshapes && results.faceBlendshapes.length > 0) {
         const shapes = results.faceBlendshapes[0].categories;
         const jawOpen = shapes.find(c => c.categoryName === 'jawOpen');
-        // Require more significant mouth movement to suppress background noise warning
+        // Require significant mouth movement to confirm candidate is speaking
         if (jawOpen && jawOpen.score > 0.15) { 
           isMouthMoving = true;
         }
 
-        // ULTRA STRICT EYE TRACKING (Apple/Google Level)
+        // CALIBRATED EYE TRACKING - Prevent false alerts while reading
         const eyeKeys = ['eyeLookInLeft', 'eyeLookOutLeft', 'eyeLookUpLeft', 'eyeLookDownLeft', 'eyeLookInRight', 'eyeLookOutRight', 'eyeLookUpRight', 'eyeLookDownRight'];
-        const isEyesWandering = eyeKeys.some(key => {
+        let isEyesWandering = eyeKeys.some(key => {
           const shape = shapes.find(c => c.categoryName === key);
-          return shape && shape.score > 0.03; // Ultra-sensitive eyeball tracking
+          return shape && shape.score > 0.82; // Calibrated 0.82 threshold - only true off-screen gaze triggers
         });
+
+        // Calibrated Iris Gaze Detection - Dual Eye + Vertical
+        if (!isEyesWandering && results.faceLandmarks && results.faceLandmarks.length > 0) {
+          const landmarks = results.faceLandmarks[0];
+          if (landmarks && landmarks.length > 473) {
+            const checkEye = (pupilIdx, innerIdx, outerIdx, topIdx, bottomIdx) => {
+              const pupil = landmarks[pupilIdx];
+              const inner = landmarks[innerIdx];
+              const outer = landmarks[outerIdx];
+              if (!pupil || !inner || !outer) return false;
+              const eyeWidth = Math.abs(outer.x - inner.x);
+              if (eyeWidth < 0.01) return false;
+              const hRatio = Math.abs(pupil.x - inner.x) / eyeWidth;
+              if (hRatio < 0.18 || hRatio > 0.82) return true;
+              if (topIdx && bottomIdx) {
+                const top = landmarks[topIdx];
+                const bottom = landmarks[bottomIdx];
+                if (top && bottom) {
+                  const eyeHeight = Math.abs(bottom.y - top.y);
+                  if (eyeHeight > 0.001) {
+                    const vRatio = (pupil.y - top.y) / eyeHeight;
+                    if (vRatio < 0.15 || vRatio > 0.85) return true;
+                  }
+                }
+              }
+              return false;
+            };
+            if (checkEye(468, 133, 33, 159, 145) || checkEye(473, 362, 263, 386, 374)) {
+              isEyesWandering = true;
+            }
+          }
+        }
 
         if (isEyesWandering) {
           eyesWanderingCountRef.current += 1;
         } else {
-          eyesWanderingCountRef.current = 0;
+          eyesWanderingCountRef.current = Math.max(0, eyesWanderingCountRef.current - 3);
         }
       }
 
-      // HEAD TURN TRACKING
+      // HEAD TURN TRACKING - Calibrated to avoid false alerts while reading
       let isHeadTurned = false;
       if (results.faceLandmarks && results.faceLandmarks.length > 0) {
         // Head tracking based on relative position of nose to ears
@@ -590,8 +619,8 @@ function CandidatePortal() {
         if (nose && leftEar && rightEar) {
           const distLeft = Math.abs(nose.x - leftEar.x);
           const distRight = Math.abs(nose.x - rightEar.x);
-          // Ultra-strict ratio
-          if (distLeft / distRight > 1.10 || distRight / distLeft > 1.10) {
+          // Calibrated ratio 2.2 - only triggers when head is turned completely away
+          if (distLeft / distRight > 2.2 || distRight / distLeft > 2.2) {
             isHeadTurned = true;
           }
         }
@@ -600,17 +629,17 @@ function CandidatePortal() {
       if (isHeadTurned) {
         headTurnCountRef.current += 1;
       } else {
-        headTurnCountRef.current = 0;
+        headTurnCountRef.current = Math.max(0, headTurnCountRef.current - 3);
       }
 
-      if (isSpeakingAudio && !isMouthMoving && !window.isAgentSpeaking) {
+      if (isConfirmedHumanVoice && !isMouthMoving && !window.isAgentSpeaking) {
         backgroundVoiceCountRef.current += 1;
       } else {
-        backgroundVoiceCountRef.current = Math.max(0, backgroundVoiceCountRef.current - 2); // Decay quickly when noise stops
+        backgroundVoiceCountRef.current = Math.max(0, backgroundVoiceCountRef.current - 3); // Faster decay to ignore transient noise
       }
 
-      // Require sustained noise (approx 1-1.5 seconds) to trigger, instead of a few frames
-      if (backgroundVoiceCountRef.current > 20 && now - lastWarningTimeRef.current > 6000) {
+      // Require sustained confirmed speech (approx 2 seconds) to trigger, ignoring pure noise
+      if (backgroundVoiceCountRef.current > 28 && now - lastWarningTimeRef.current > 7000) {
         if (isCameraCheckPhaseRef.current) {
           isPreCheckFailedRef.current = "Environment scan failed: Background voices detected. You must be in a quiet environment.";
         } else {
@@ -621,16 +650,16 @@ function CandidatePortal() {
         }
       }
 
-      // Flag wandering eyes after approx 400ms (ruthless)
-      if (eyesWanderingCountRef.current > 5 && now - lastWarningTimeRef.current > 3000) {
+      // Flag wandering eyes - calibrated: sustained off-screen gaze >45 frames, 5s cooldown
+      if (eyesWanderingCountRef.current > 45 && now - lastWarningTimeRef.current > 5000) {
         setWarningsCount(prev => prev + 1);
         recordProctoringEvent("EYES_WANDERING");
         lastWarningTimeRef.current = now;
         eyesWanderingCountRef.current = 0;
       }
 
-      // Flag head turn after approx 400ms
-      if (headTurnCountRef.current > 5 && now - lastWarningTimeRef.current > 3000) {
+      // Flag head turn - calibrated: sustained turn >45 frames
+      if (headTurnCountRef.current > 45 && now - lastWarningTimeRef.current > 5000) {
         setWarningsCount(prev => prev + 1);
         recordProctoringEvent("HEAD_TURNED");
         lastWarningTimeRef.current = now;

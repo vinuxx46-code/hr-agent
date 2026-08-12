@@ -1052,26 +1052,24 @@ function CandidatePortal({ directQA = false }) {
         }
       }
 
-      // BACKGROUND VOICE DETECTION (LIP SYNC CORRELATION)
-      let isSpeakingAudio = false;
+      // BACKGROUND VOICE DETECTION - Noise-Ignoring Implementation
+      // Fix: Ignore ambient noise (fans, AC, typing, traffic) for multiple voice detection.
+      // Only confirmed human speech via Web Speech API counts toward background voice.
+      // Acoustic energy is monitored for typing detection but explicitly NOT counted as background voice to prevent false positives.
+      let isConfirmedHumanVoice = isHumanSpeechDetectedRef.current; // high-confidence word-level detection
+      let ambientNoiseLevel = 0;
 
-      if (isHumanSpeechDetectedRef.current) {
-        isSpeakingAudio = true; // SpeechRecognition detected actual human words/voice
-      } else if (audioAnalyserRef.current && audioDataArrayRef.current) {
-        // Fallback strict acoustic check if SpeechRecognition is not supported
+      if (audioAnalyserRef.current && audioDataArrayRef.current) {
         audioAnalyserRef.current.getByteFrequencyData(audioDataArrayRef.current);
         let sum = 0;
         let count = 0;
-        // Much narrower focus to avoid broadband noise (e.g. 500Hz-2000Hz only)
         for (let i = 3; i < 15 && i < audioDataArrayRef.current.length; i++) {
           sum += audioDataArrayRef.current[i];
           count++;
         }
-        let average = count > 0 ? sum / count : 0;
-        // Very high threshold so random noise doesn't trigger it, only loud sustained sounds
-        if (average > 60) isSpeakingAudio = true;
+        ambientNoiseLevel = count > 0 ? sum / count : 0;
 
-        // KEYBOARD TYPING DETECTION (High Frequency Spikes)
+        // KEYBOARD TYPING DETECTION (High Frequency Spikes) - independent from voice, not treated as background voice
         let highFreqSum = 0;
         let highFreqCount = 0;
         for (let i = 50; i < 150 && i < audioDataArrayRef.current.length; i++) {
@@ -1079,7 +1077,7 @@ function CandidatePortal({ directQA = false }) {
           highFreqCount++;
         }
         let highFreqAverage = highFreqCount > 0 ? highFreqSum / highFreqCount : 0;
-        if (highFreqAverage > 45 && !isSpeakingAudio && currentQuestionIndex >= 0) {
+        if (highFreqAverage > 45 && !isConfirmedHumanVoice && currentQuestionIndex >= 0) {
           recordProctoringEvent("KEYBOARD_TYPING_DETECTED");
         }
       }
@@ -1088,34 +1086,52 @@ function CandidatePortal({ directQA = false }) {
       if (results.faceBlendshapes && results.faceBlendshapes.length > 0) {
         const shapes = results.faceBlendshapes[0].categories;
         const jawOpen = shapes.find(c => c.categoryName === 'jawOpen');
-        // Require more significant mouth movement to suppress background noise warning
+        // Require significant mouth movement to confirm candidate is speaking
         if (jawOpen && jawOpen.score > 0.15) { 
           isMouthMoving = true;
         }
 
-        // ENTERPRISE STRICT DUAL-MODE EYE TRACKING (Blendshapes + Iris Pupil Landmarks)
+        // ENTERPRISE CALIBRATED DUAL-MODE EYE TRACKING (Blendshapes + Dual Iris Pupil Landmarks)
+        // Calibrated thresholds: blendshape 0.82 instead of 0.75 to reduce false positives while reading
+        // Iris: dual-eye check with 0.18-0.82 horizontal and 0.15-0.85 vertical calibration
         const eyeKeys = ['eyeLookInLeft', 'eyeLookOutLeft', 'eyeLookUpLeft', 'eyeLookDownLeft', 'eyeLookInRight', 'eyeLookOutRight', 'eyeLookUpRight', 'eyeLookDownRight'];
         let isEyesWandering = eyeKeys.some(key => {
           const shape = shapes.find(c => c.categoryName === key);
-          return shape && shape.score > 0.75; // Calibrated 0.75 gaze threshold (prevents false alerts while reading on-screen text)
+          return shape && shape.score > 0.82; // Calibrated 0.82 gaze threshold - only true off-screen gaze triggers, reading is ignored
         });
 
-        // Iris Pupil Landmark Position Tracking (Gaze Vector)
+        // Calibrated Iris Pupil Landmark Tracking - Dual Eye + Vertical
         if (!isEyesWandering && results.faceLandmarks && results.faceLandmarks.length > 0) {
           const landmarks = results.faceLandmarks[0];
           if (landmarks && landmarks.length > 473) {
-            const leftPupil = landmarks[468];
-            const leftCornerInner = landmarks[133];
-            const leftCornerOuter = landmarks[33];
-            if (leftPupil && leftCornerInner && leftCornerOuter) {
-              const eyeWidth = Math.abs(leftCornerOuter.x - leftCornerInner.x);
-              if (eyeWidth > 0) {
-                const pupilRatio = Math.abs(leftPupil.x - leftCornerInner.x) / eyeWidth;
-                // Pupil deviation outside true off-screen bounds (< 0.05 or > 0.95)
-                if (pupilRatio < 0.05 || pupilRatio > 0.95) {
-                  isEyesWandering = true;
+            const checkEye = (pupilIdx, innerIdx, outerIdx, topIdx, bottomIdx) => {
+              const pupil = landmarks[pupilIdx];
+              const inner = landmarks[innerIdx];
+              const outer = landmarks[outerIdx];
+              if (!pupil || !inner || !outer) return false;
+              const eyeWidth = Math.abs(outer.x - inner.x);
+              if (eyeWidth < 0.01) return false;
+              const hRatio = Math.abs(pupil.x - inner.x) / eyeWidth;
+              // Calibrated horizontal: <0.18 or >0.82 = true off-screen, 0.18-0.82 = normal reading range
+              if (hRatio < 0.18 || hRatio > 0.82) return true;
+              // Calibrated vertical check
+              if (topIdx && bottomIdx) {
+                const top = landmarks[topIdx];
+                const bottom = landmarks[bottomIdx];
+                if (top && bottom) {
+                  const eyeHeight = Math.abs(bottom.y - top.y);
+                  if (eyeHeight > 0.001) {
+                    const vRatio = (pupil.y - top.y) / eyeHeight;
+                    if (vRatio < 0.15 || vRatio > 0.85) return true;
+                  }
                 }
               }
+              return false;
+            };
+            // Left eye: 468 pupil, 133 inner, 33 outer, 159 top, 145 bottom
+            // Right eye: 473 pupil, 362 inner, 263 outer, 386 top, 374 bottom
+            if (checkEye(468, 133, 33, 159, 145) || checkEye(473, 362, 263, 386, 374)) {
+              isEyesWandering = true;
             }
           }
         }
@@ -1151,14 +1167,15 @@ function CandidatePortal({ directQA = false }) {
         headTurnCountRef.current = Math.max(0, headTurnCountRef.current - 3);
       }
 
-      if (isSpeakingAudio && !isMouthMoving && !window.isAgentSpeaking) {
+      // Noise-filtered: only confirmed human voice (SpeechRecognition) triggers background voice, not ambient noise
+      if (isConfirmedHumanVoice && !isMouthMoving && !window.isAgentSpeaking) {
         backgroundVoiceCountRef.current += 1;
       } else {
-        backgroundVoiceCountRef.current = Math.max(0, backgroundVoiceCountRef.current - 2); // Decay quickly when noise stops
+        backgroundVoiceCountRef.current = Math.max(0, backgroundVoiceCountRef.current - 3); // Faster decay to ignore transient noise
       }
 
-      // Require sustained noise (approx 1-1.5 seconds) to trigger, instead of a few frames
-      if (backgroundVoiceCountRef.current > 20 && now - lastWarningTimeRef.current > 6000) {
+      // Require sustained confirmed speech (approx 2 seconds) to trigger, ignoring pure noise
+      if (backgroundVoiceCountRef.current > 28 && now - lastWarningTimeRef.current > 7000) {
         if (isCameraCheckPhaseRef.current) {
           isPreCheckFailedRef.current = "Environment scan failed: Background voices detected. You must be in a quiet environment.";
         } else {

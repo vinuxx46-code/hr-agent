@@ -562,21 +562,53 @@ function CandidatePortal() {
           isMouthMoving = true;
         }
 
-        // ULTRA STRICT EYE TRACKING (Apple/Google Level)
+        // CALIBRATED EYE TRACKING - Prevent false alerts while reading
         const eyeKeys = ['eyeLookInLeft', 'eyeLookOutLeft', 'eyeLookUpLeft', 'eyeLookDownLeft', 'eyeLookInRight', 'eyeLookOutRight', 'eyeLookUpRight', 'eyeLookDownRight'];
-        const isEyesWandering = eyeKeys.some(key => {
+        let isEyesWandering = eyeKeys.some(key => {
           const shape = shapes.find(c => c.categoryName === key);
-          return shape && shape.score > 0.03; // Ultra-sensitive eyeball tracking
+          return shape && shape.score > 0.82; // Calibrated 0.82 threshold - only true off-screen gaze triggers
         });
+
+        // Calibrated Iris Gaze Detection - Dual Eye + Vertical
+        if (!isEyesWandering && results.faceLandmarks && results.faceLandmarks.length > 0) {
+          const landmarks = results.faceLandmarks[0];
+          if (landmarks && landmarks.length > 473) {
+            const checkEye = (pupilIdx, innerIdx, outerIdx, topIdx, bottomIdx) => {
+              const pupil = landmarks[pupilIdx];
+              const inner = landmarks[innerIdx];
+              const outer = landmarks[outerIdx];
+              if (!pupil || !inner || !outer) return false;
+              const eyeWidth = Math.abs(outer.x - inner.x);
+              if (eyeWidth < 0.01) return false;
+              const hRatio = Math.abs(pupil.x - inner.x) / eyeWidth;
+              if (hRatio < 0.18 || hRatio > 0.82) return true;
+              if (topIdx && bottomIdx) {
+                const top = landmarks[topIdx];
+                const bottom = landmarks[bottomIdx];
+                if (top && bottom) {
+                  const eyeHeight = Math.abs(bottom.y - top.y);
+                  if (eyeHeight > 0.001) {
+                    const vRatio = (pupil.y - top.y) / eyeHeight;
+                    if (vRatio < 0.15 || vRatio > 0.85) return true;
+                  }
+                }
+              }
+              return false;
+            };
+            if (checkEye(468, 133, 33, 159, 145) || checkEye(473, 362, 263, 386, 374)) {
+              isEyesWandering = true;
+            }
+          }
+        }
 
         if (isEyesWandering) {
           eyesWanderingCountRef.current += 1;
         } else {
-          eyesWanderingCountRef.current = 0;
+          eyesWanderingCountRef.current = Math.max(0, eyesWanderingCountRef.current - 3);
         }
       }
 
-      // HEAD TURN TRACKING
+      // HEAD TURN TRACKING - Calibrated to avoid false alerts while reading
       let isHeadTurned = false;
       if (results.faceLandmarks && results.faceLandmarks.length > 0) {
         // Head tracking based on relative position of nose to ears
@@ -587,8 +619,8 @@ function CandidatePortal() {
         if (nose && leftEar && rightEar) {
           const distLeft = Math.abs(nose.x - leftEar.x);
           const distRight = Math.abs(nose.x - rightEar.x);
-          // Ultra-strict ratio
-          if (distLeft / distRight > 1.10 || distRight / distLeft > 1.10) {
+          // Calibrated ratio 2.2 - only triggers when head is turned completely away
+          if (distLeft / distRight > 2.2 || distRight / distLeft > 2.2) {
             isHeadTurned = true;
           }
         }
@@ -597,7 +629,7 @@ function CandidatePortal() {
       if (isHeadTurned) {
         headTurnCountRef.current += 1;
       } else {
-        headTurnCountRef.current = 0;
+        headTurnCountRef.current = Math.max(0, headTurnCountRef.current - 3);
       }
 
       if (isConfirmedHumanVoice && !isMouthMoving && !window.isAgentSpeaking) {
@@ -618,16 +650,16 @@ function CandidatePortal() {
         }
       }
 
-      // Flag wandering eyes after approx 400ms (ruthless)
-      if (eyesWanderingCountRef.current > 5 && now - lastWarningTimeRef.current > 3000) {
+      // Flag wandering eyes - calibrated: sustained off-screen gaze >45 frames, 5s cooldown
+      if (eyesWanderingCountRef.current > 45 && now - lastWarningTimeRef.current > 5000) {
         setWarningsCount(prev => prev + 1);
         recordProctoringEvent("EYES_WANDERING");
         lastWarningTimeRef.current = now;
         eyesWanderingCountRef.current = 0;
       }
 
-      // Flag head turn after approx 400ms
-      if (headTurnCountRef.current > 5 && now - lastWarningTimeRef.current > 3000) {
+      // Flag head turn - calibrated: sustained turn >45 frames
+      if (headTurnCountRef.current > 45 && now - lastWarningTimeRef.current > 5000) {
         setWarningsCount(prev => prev + 1);
         recordProctoringEvent("HEAD_TURNED");
         lastWarningTimeRef.current = now;

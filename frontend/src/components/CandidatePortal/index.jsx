@@ -1091,29 +1091,47 @@ function CandidatePortal({ directQA = false }) {
           isMouthMoving = true;
         }
 
-        // ENTERPRISE STRICT DUAL-MODE EYE TRACKING (Blendshapes + Iris Pupil Landmarks)
+        // ENTERPRISE CALIBRATED DUAL-MODE EYE TRACKING (Blendshapes + Dual Iris Pupil Landmarks)
+        // Calibrated thresholds: blendshape 0.82 instead of 0.75 to reduce false positives while reading
+        // Iris: dual-eye check with 0.18-0.82 horizontal and 0.15-0.85 vertical calibration
         const eyeKeys = ['eyeLookInLeft', 'eyeLookOutLeft', 'eyeLookUpLeft', 'eyeLookDownLeft', 'eyeLookInRight', 'eyeLookOutRight', 'eyeLookUpRight', 'eyeLookDownRight'];
         let isEyesWandering = eyeKeys.some(key => {
           const shape = shapes.find(c => c.categoryName === key);
-          return shape && shape.score > 0.75; // Calibrated 0.75 gaze threshold (prevents false alerts while reading on-screen text)
+          return shape && shape.score > 0.82; // Calibrated 0.82 gaze threshold - only true off-screen gaze triggers, reading is ignored
         });
 
-        // Iris Pupil Landmark Position Tracking (Gaze Vector)
+        // Calibrated Iris Pupil Landmark Tracking - Dual Eye + Vertical
         if (!isEyesWandering && results.faceLandmarks && results.faceLandmarks.length > 0) {
           const landmarks = results.faceLandmarks[0];
           if (landmarks && landmarks.length > 473) {
-            const leftPupil = landmarks[468];
-            const leftCornerInner = landmarks[133];
-            const leftCornerOuter = landmarks[33];
-            if (leftPupil && leftCornerInner && leftCornerOuter) {
-              const eyeWidth = Math.abs(leftCornerOuter.x - leftCornerInner.x);
-              if (eyeWidth > 0) {
-                const pupilRatio = Math.abs(leftPupil.x - leftCornerInner.x) / eyeWidth;
-                // Pupil deviation outside true off-screen bounds (< 0.05 or > 0.95)
-                if (pupilRatio < 0.05 || pupilRatio > 0.95) {
-                  isEyesWandering = true;
+            const checkEye = (pupilIdx, innerIdx, outerIdx, topIdx, bottomIdx) => {
+              const pupil = landmarks[pupilIdx];
+              const inner = landmarks[innerIdx];
+              const outer = landmarks[outerIdx];
+              if (!pupil || !inner || !outer) return false;
+              const eyeWidth = Math.abs(outer.x - inner.x);
+              if (eyeWidth < 0.01) return false;
+              const hRatio = Math.abs(pupil.x - inner.x) / eyeWidth;
+              // Calibrated horizontal: <0.18 or >0.82 = true off-screen, 0.18-0.82 = normal reading range
+              if (hRatio < 0.18 || hRatio > 0.82) return true;
+              // Calibrated vertical check
+              if (topIdx && bottomIdx) {
+                const top = landmarks[topIdx];
+                const bottom = landmarks[bottomIdx];
+                if (top && bottom) {
+                  const eyeHeight = Math.abs(bottom.y - top.y);
+                  if (eyeHeight > 0.001) {
+                    const vRatio = (pupil.y - top.y) / eyeHeight;
+                    if (vRatio < 0.15 || vRatio > 0.85) return true;
+                  }
                 }
               }
+              return false;
+            };
+            // Left eye: 468 pupil, 133 inner, 33 outer, 159 top, 145 bottom
+            // Right eye: 473 pupil, 362 inner, 263 outer, 386 top, 374 bottom
+            if (checkEye(468, 133, 33, 159, 145) || checkEye(473, 362, 263, 386, 374)) {
+              isEyesWandering = true;
             }
           }
         }

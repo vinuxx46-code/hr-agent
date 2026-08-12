@@ -536,31 +536,28 @@ function CandidatePortal() {
         }
       }
 
-      // BACKGROUND VOICE DETECTION (LIP SYNC CORRELATION)
-      let isSpeakingAudio = false;
+      // BACKGROUND VOICE DETECTION - Noise-Ignoring Implementation
+      // Ignore ambient noise for multiple voice detection. Only confirmed speech API words count.
+      let isConfirmedHumanVoice = isHumanSpeechDetectedRef.current;
+      let ambientNoiseLevel = 0;
 
-      if (isHumanSpeechDetectedRef.current) {
-        isSpeakingAudio = true; // SpeechRecognition detected actual human words/voice
-      } else if (audioAnalyserRef.current && audioDataArrayRef.current) {
-        // Fallback strict acoustic check if SpeechRecognition is not supported
+      if (audioAnalyserRef.current && audioDataArrayRef.current) {
         audioAnalyserRef.current.getByteFrequencyData(audioDataArrayRef.current);
         let sum = 0;
         let count = 0;
-        // Much narrower focus to avoid broadband noise (e.g. 500Hz-2000Hz only)
         for (let i = 3; i < 15 && i < audioDataArrayRef.current.length; i++) {
           sum += audioDataArrayRef.current[i];
           count++;
         }
-        let average = count > 0 ? sum / count : 0;
-        // Very high threshold so random noise doesn't trigger it, only loud sustained sounds
-        if (average > 60) isSpeakingAudio = true;
+        ambientNoiseLevel = count > 0 ? sum / count : 0;
+        // Ambient noise explicitly ignored for background voice - only SpeechRecognition words count
       }
 
       let isMouthMoving = false;
       if (results.faceBlendshapes && results.faceBlendshapes.length > 0) {
         const shapes = results.faceBlendshapes[0].categories;
         const jawOpen = shapes.find(c => c.categoryName === 'jawOpen');
-        // Require more significant mouth movement to suppress background noise warning
+        // Require significant mouth movement to confirm candidate is speaking
         if (jawOpen && jawOpen.score > 0.15) { 
           isMouthMoving = true;
         }
@@ -603,14 +600,14 @@ function CandidatePortal() {
         headTurnCountRef.current = 0;
       }
 
-      if (isSpeakingAudio && !isMouthMoving && !window.isAgentSpeaking) {
+      if (isConfirmedHumanVoice && !isMouthMoving && !window.isAgentSpeaking) {
         backgroundVoiceCountRef.current += 1;
       } else {
-        backgroundVoiceCountRef.current = Math.max(0, backgroundVoiceCountRef.current - 2); // Decay quickly when noise stops
+        backgroundVoiceCountRef.current = Math.max(0, backgroundVoiceCountRef.current - 3); // Faster decay to ignore transient noise
       }
 
-      // Require sustained noise (approx 1-1.5 seconds) to trigger, instead of a few frames
-      if (backgroundVoiceCountRef.current > 20 && now - lastWarningTimeRef.current > 6000) {
+      // Require sustained confirmed speech (approx 2 seconds) to trigger, ignoring pure noise
+      if (backgroundVoiceCountRef.current > 28 && now - lastWarningTimeRef.current > 7000) {
         if (isCameraCheckPhaseRef.current) {
           isPreCheckFailedRef.current = "Environment scan failed: Background voices detected. You must be in a quiet environment.";
         } else {

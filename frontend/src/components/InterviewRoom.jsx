@@ -103,7 +103,7 @@ function CandidatePortal() {
     if (token) {
       setInviteToken(token);
       // Validate token
-      fetch(`http://127.0.0.1:8000/api/validate-token/${token}`)
+      fetch(`/api/validate-token/${token}`)
         .then(res => res.json())
         .then(data => {
           if (data.valid) {
@@ -271,7 +271,7 @@ function CandidatePortal() {
       email: finalEmail
     };
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/hr/send-invites', {
+      const res = await fetch('/api/hr/send-invites', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ candidates: [candidateData], expiry_hours: 48 })
@@ -309,7 +309,7 @@ function CandidatePortal() {
     
     setIsSendingBulk(true);
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/hr/send-invites', {
+      const res = await fetch('/api/hr/send-invites', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ candidates: validShortlisted, expiry_hours: 48 })
@@ -342,7 +342,7 @@ function CandidatePortal() {
 
     try {
       const isZip = file.name.toLowerCase().endsWith('.zip');
-      const endpoint = isZip ? 'http://127.0.0.1:8000/api/bulk-upload' : 'http://127.0.0.1:8000/api/upload-resume';
+      const endpoint = isZip ? '/api/bulk-upload' : '/api/upload-resume';
       
       // The backend expects 'resume' for single upload, and 'file' for bulk upload
       const formData = new FormData();
@@ -921,7 +921,7 @@ function CandidatePortal() {
 
     try {
       // Call Backend to generate questions
-      const response = await fetch('http://127.0.0.1:8000/api/interview/start', {
+      const response = await fetch('/api/interview/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1016,7 +1016,7 @@ function CandidatePortal() {
     }
 
     try {
-      const response = await fetch('http://127.0.0.1:8000/api/interview/answer', {
+      const response = await fetch('/api/interview/answer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1066,7 +1066,7 @@ function CandidatePortal() {
       formData.append("video", videoBlob, "recording.webm");
       formData.append("proctoring_logs", JSON.stringify(proctoringEvents.current));
 
-      const response = await fetch(`http://127.0.0.1:8000/api/upload-interview-data/${inviteToken}`, {
+      const response = await fetch(`/api/upload-interview-data/${inviteToken}`, {
         method: 'POST',
         body: formData
       });

@@ -136,6 +136,9 @@ function CandidatePortal({ directQA = false }) {
   const animationRef = useRef(null);
   const lastVideoTimeRef = useRef(-1);
   const lastInferenceTimeRef = useRef(0);
+  const lastObjectInferenceTimeRef = useRef(0);
+  const objectResultsRef = useRef(null);
+  const handResultsRef = useRef(null);
   const lastWarningTimeRef = useRef(0);
 
   // Audio analysis refs
@@ -380,7 +383,7 @@ function CandidatePortal({ directQA = false }) {
       validatedTokens.add(token);
       setInviteToken(token);
       // Validate token
-      fetch(`http://127.0.0.1:8000/api/validate-token/${token}`)
+      fetch(`/api/validate-token/${token}`)
         .then(res => res.json())
         .then(data => {
           if (data.valid) {
@@ -603,7 +606,7 @@ function CandidatePortal({ directQA = false }) {
             // Validate 360-degree verification result and send proctoring events to backend server
             const activeToken = inviteToken || new URLSearchParams(window.location.search).get('token');
             if (activeToken) {
-              fetch(`http://127.0.0.1:8000/api/verify-360-scan/${activeToken}`, {
+              fetch(`/api/verify-360-scan/${activeToken}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ proctoringEvents: proctoringEvents.current })
@@ -750,7 +753,7 @@ function CandidatePortal({ directQA = false }) {
       email: finalEmail
     };
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/hr/send-invites', {
+      const res = await fetch('/api/hr/send-invites', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ candidates: [candidateData], expiry_hours: 48 })
@@ -788,7 +791,7 @@ function CandidatePortal({ directQA = false }) {
     
     setIsSendingBulk(true);
     try {
-      const res = await fetch('http://127.0.0.1:8000/api/hr/send-invites', {
+      const res = await fetch('/api/hr/send-invites', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ candidates: validShortlisted, expiry_hours: 48 })
@@ -821,7 +824,7 @@ function CandidatePortal({ directQA = false }) {
 
     try {
       const isZip = file.name.toLowerCase().endsWith('.zip');
-      const endpoint = isZip ? 'http://127.0.0.1:8000/api/bulk-upload' : 'http://127.0.0.1:8000/api/upload-resume';
+      const endpoint = isZip ? '/api/bulk-upload' : '/api/upload-resume';
       
       // The backend expects 'resume' for single upload, and 'file' for bulk upload
       const formData = new FormData();
@@ -875,7 +878,7 @@ function CandidatePortal({ directQA = false }) {
     // Send real-time event report to backend for HR audit logging
     const activeToken = inviteToken || new URLSearchParams(window.location.search).get('token');
     if (activeToken) {
-      fetch(`http://127.0.0.1:8000/api/log-proctoring-event/${activeToken}`, {
+      fetch(`/api/log-proctoring-event/${activeToken}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(eventObj)
@@ -911,7 +914,9 @@ function CandidatePortal({ directQA = false }) {
     }
 
     let startTimeMs = performance.now();
-    if (startTimeMs - lastInferenceTimeRef.current < 150) {
+    // Face landmarks drive gaze/lip checks. Run them at 4 FPS: this is responsive
+    // enough for proctoring and avoids freezing the interview UI on slower laptops.
+    if (startTimeMs - lastInferenceTimeRef.current < 250) {
       animationRef.current = requestAnimationFrame(predictWebcam);
       return;
     }
@@ -920,8 +925,20 @@ function CandidatePortal({ directQA = false }) {
       lastVideoTimeRef.current = videoRef.current.currentTime;
 
       const results = landmarkerRef.current.detectForVideo(videoRef.current, startTimeMs);
-      const objectResults = objectDetectorRef.current ? objectDetectorRef.current.detectForVideo(videoRef.current, startTimeMs) : null;
-      const handResults = handLandmarkerRef.current ? handLandmarkerRef.current.detectForVideo(videoRef.current, startTimeMs) : null;
+
+      // Object and hand models are much more expensive than face landmarks. Their
+      // result is stable across a few frames, so sample them independently at 1.25 FPS.
+      if (startTimeMs - lastObjectInferenceTimeRef.current >= 800) {
+        objectResultsRef.current = objectDetectorRef.current
+          ? objectDetectorRef.current.detectForVideo(videoRef.current, startTimeMs)
+          : null;
+        handResultsRef.current = handLandmarkerRef.current
+          ? handLandmarkerRef.current.detectForVideo(videoRef.current, startTimeMs)
+          : null;
+        lastObjectInferenceTimeRef.current = startTimeMs;
+      }
+      const objectResults = objectResultsRef.current;
+      const handResults = handResultsRef.current;
 
       // Filter out 2D wall paintings, background posters, drawings, and small background artwork
       const filterValidHumanFaces = (faceLandmarksList) => {
@@ -1193,7 +1210,12 @@ function CandidatePortal({ directQA = false }) {
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        // Limiting capture resolution prevents three synchronous WASM models from
+        // monopolising the main thread while retaining reliable face landmarks.
+        video: { width: { ideal: 640, max: 960 }, height: { ideal: 480, max: 540 }, frameRate: { ideal: 15, max: 20 } },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
       streamRef.current = stream;
       
       // Clean up previous screen share listeners if replacing
@@ -1406,7 +1428,7 @@ function CandidatePortal({ directQA = false }) {
     // Immediately mark token as USED / EXPIRED on backend (Single-Use Token Enforcement)
     const activeToken = inviteToken || new URLSearchParams(window.location.search).get('token');
     if (activeToken) {
-      fetch(`http://127.0.0.1:8000/api/expire-token/${activeToken}`, { method: 'POST' }).catch(() => {});
+      fetch(`/api/expire-token/${activeToken}`, { method: 'POST' }).catch(() => {});
     }
 
     sessionStorage.setItem('wasScanning', 'true');
@@ -1469,7 +1491,7 @@ function CandidatePortal({ directQA = false }) {
       }
 
       // Call Backend to generate customized questions in background
-      fetch('http://127.0.0.1:8000/api/interview/start', {
+      fetch('/api/interview/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1598,7 +1620,7 @@ function CandidatePortal({ directQA = false }) {
     }
 
     try {
-      const response = await fetch('http://127.0.0.1:8000/api/interview/answer', {
+      const response = await fetch('/api/interview/answer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1685,7 +1707,7 @@ function CandidatePortal({ directQA = false }) {
       formData.append("video", videoBlob, "recording.webm");
       formData.append("proctoring_logs", JSON.stringify(proctoringEvents.current));
 
-      const response = await fetch(`http://127.0.0.1:8000/api/upload-interview-data/${inviteToken}`, {
+      const response = await fetch(`/api/upload-interview-data/${inviteToken}`, {
         method: 'POST',
         body: formData
       });
@@ -2146,7 +2168,7 @@ function CandidatePortal({ directQA = false }) {
                   onClick={() => {
                     const activeToken = inviteToken || new URLSearchParams(window.location.search).get('token');
                     if (activeToken) {
-                      fetch(`http://127.0.0.1:8000/api/verify-360-scan/${activeToken}`, {
+                      fetch(`/api/verify-360-scan/${activeToken}`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ proctoringEvents: proctoringEvents.current })

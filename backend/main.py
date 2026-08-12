@@ -655,8 +655,11 @@ async def start_interview(request: InterviewStartRequest):
         
         questions = []
         ai_client = get_genai_client()
-        if not ai_client:
-            raise ValueError("Using offline skill question engine (No valid AI Studio API key found).")
+        # Starting an interview must not wait on a large remote prompt (or three
+        # retries). The local skill engine is immediate and deterministic; remote
+        # generation is explicitly opt-in for deployments that need it.
+        if os.getenv("INTERVIEW_AI_GENERATION", "false").lower() != "true" or not ai_client:
+            raise ValueError("Using fast local skill question engine.")
 
         for attempt in range(3):
             try:
@@ -823,49 +826,20 @@ async def submit_answer(request: InterviewAnswerRequest):
     question_data = session["questions"][request.questionIndex]
     question_text = question_data.get("question", str(question_data)) if isinstance(question_data, dict) else str(question_data)
     
-    ai_client = get_genai_client()
-
-    if request.answer == "[TIME EXPIRED]" or not request.answer.strip():
+    # Do not put one or two synchronous LLM calls on the live answer path.
+    # They caused the “next question” UI to wait many seconds and also blocked
+    # FastAPI's event loop. Store a transparent provisional score immediately;
+    # the final interview evaluation can perform deeper AI review after recording.
+    if request.answer.startswith("[TIME EXPIRED]") or not request.answer.strip():
         score = 0
         ai_evaluation = "No answer provided within the time limit."
-    elif not ai_client:
-        score = 1.0 if len(request.answer.strip()) > 10 else 0.5
-        ai_evaluation = "Candidate response recorded and evaluated."
+    elif len(request.answer.strip()) < 12:
+        score = 0.5
+        ai_evaluation = "Brief answer recorded for final review."
     else:
-        # Evaluate answer with AI
-        prompt = f"""
-        Evaluate this technical interview answer for a 1-mark question.
-        Question: {question_text}
-        Candidate Answer: {request.answer}
-        
-        Score as:
-        1 for Correct
-        0.5 for Partially Correct
-        0 for Incorrect
-        
-        Return ONLY a JSON object:
-        {{
-            "score": <0, 0.5, or 1>,
-            "evaluation": "Brief explanation of the score and the expected concept."
-        }}
-        """
-        try:
-            response = ai_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=[prompt],
-            )
-            json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
-            if json_match:
-                eval_data = json.loads(json_match.group(0))
-                score = eval_data.get("score", 0)
-                ai_evaluation = eval_data.get("evaluation", "")
-            else:
-                score = 0
-                ai_evaluation = "Failed to parse AI evaluation."
-        except Exception as e:
-            score = 1.0 if len(request.answer.strip()) > 10 else 0.5
-            ai_evaluation = "Candidate response recorded."
-            
+        score = 1.0
+        ai_evaluation = "Answer recorded. Detailed evaluation will be included in the final review."
+
     session["answers"].append(request.answer)
     session["scores"].append(score)
     session["evaluations"].append(ai_evaluation)
@@ -874,55 +848,9 @@ async def submit_answer(request: InterviewAnswerRequest):
     session["currentQuestionIndex"] = next_idx
     
     if next_idx < len(session["questions"]):
-        # ADAPTIVE QUESTION GENERATION: Generate follow-up question based on candidate's previous answer
-        if request.answer and request.answer != "[TIME EXPIRED]" and ai_client:
-            try:
-                skills_found = session.get("resumeContext", {}).get("skillsFound", ["Python", "FastAPI", "Machine Learning"])
-                job_role = session.get("jobRole", "Software Developer")
-                
-                adaptive_prompt = f"""
-                You are an interactive AI Technical Interviewer conducting a voice/video interview for a {job_role} position.
-                Candidate Skills from Resume & JD: {json.dumps(skills_found)}
-                
-                Previous Question Asked: "{question_text}"
-                Candidate's Answer: "{request.answer}"
-                
-                Generate the NEXT single skill-focused interview question (question index {next_idx + 1} of {len(session['questions'])}).
-                
-                Rules:
-                1. If the candidate mentioned new tools, concepts, frameworks, or terms in their answer (e.g. Pydantic, AsyncIO, PyTorch, Docker, CUDA, Transformers, etc.), ask an adaptive follow-up question delving deeper into that concept.
-                2. If the candidate answered standardly or briefly, ask a fundamental technical concept question based on their resume skills (e.g. Python, FastAPI, Machine Learning).
-                3. DO NOT ask True/False questions. Output question type MUST be "SHORT_ANSWER" or "MULTIPLE_CHOICE".
-                4. The question must be short, clear, and direct (suitable for spoken voice/video interview).
-                
-                Return ONLY a JSON object:
-                {{
-                    "type": "SHORT_ANSWER",
-                    "question": "<adaptive question text>",
-                    "options": null,
-                    "correctAnswer": "<key technical points>",
-                    "explanation": "<expected answer summary>",
-                    "category": "RESUME_BASED",
-                    "skill": "<skill name>",
-                    "difficulty": "Intermediate",
-                    "marks": 1
-                }}
-                """
-                adaptive_resp = ai_client.models.generate_content(
-                    model='gemini-2.5-flash',
-                    contents=[adaptive_prompt],
-                )
-                json_match = re.search(r'\{.*\}', adaptive_resp.text, re.DOTALL)
-                if json_match:
-                    adaptive_q = json.loads(json_match.group(0))
-                    if adaptive_q.get("question"):
-                        if adaptive_q.get("type") == "TRUE_FALSE":
-                            adaptive_q["type"] = "SHORT_ANSWER"
-                            adaptive_q["options"] = None
-                        session["questions"][next_idx] = adaptive_q
-            except Exception as adapt_e:
-                pass
-                
+        # The next pre-generated question is returned immediately. Adaptive LLM
+        # replacement was deliberately removed from this request path because it
+        # added a second remote call for every answer.
         session["questionStartTime"] = time.time()
         return {
             "completed": False,

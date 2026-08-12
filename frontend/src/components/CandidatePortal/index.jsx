@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import ReactDOM from 'react-dom';
 import { FaceLandmarker, ObjectDetector, HandLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+import { ViolationTracker, detectGazeAway, detectHeadTurned, countPeople, isFaceOutOfFrame } from '../../proctoring/detection';
 import '../../index.css';
 
 // Suppress verbose MediaPipe WebAssembly logs to clear the console
@@ -148,10 +149,19 @@ function CandidatePortal({ directQA = false }) {
   const recognitionRef = useRef(null);
   const shouldListenRef = useRef(false);
   const isHumanSpeechDetectedRef = useRef(false);
-  const backgroundVoiceCountRef = useRef(0);
-  const headTurnCountRef = useRef(0);
-  const eyesWanderingCountRef = useRef(0);
   const majorPanFramesRef = useRef(0);
+
+  // Time-based violation trackers. The old frame counters assumed ~30 FPS but
+  // the detection loop runs at ~4 FPS, so a "45 frame" threshold silently
+  // required ~11 seconds of uninterrupted violation and rarely ever fired.
+  // These accumulate real elapsed milliseconds, so the thresholds hold no
+  // matter how fast the loop or device is.
+  const gazeTrackerRef = useRef(new ViolationTracker({ requiredMs: 2500, cooldownMs: 8000 }));
+  const headTrackerRef = useRef(new ViolationTracker({ requiredMs: 2500, cooldownMs: 8000 }));
+  const voiceTrackerRef = useRef(new ViolationTracker({ requiredMs: 2000, cooldownMs: 8000 }));
+  const noFaceTrackerRef = useRef(new ViolationTracker({ requiredMs: 2000, cooldownMs: 6000 }));
+  const multiFaceTrackerRef = useRef(new ViolationTracker({ requiredMs: 1200, cooldownMs: 6000 }));
+  const outOfFrameTrackerRef = useRef(new ViolationTracker({ requiredMs: 2000, cooldownMs: 6000 }));
 
   const timerRef = useRef(null);
   const cameraTimerRef = useRef(null);
@@ -1072,19 +1082,12 @@ function CandidatePortal({ directQA = false }) {
       let totalPeople = currentFaces;
 
       if (objectResults && objectResults.detections) {
-        const persons = objectResults.detections.filter(d => {
-          const cat = d.categories[0];
-          if (cat.categoryName !== "person") return false;
-          if (cat.score < 0.68) return false; // Ignore low confidence detections (paintings, cartoons)
-          const bbox = d.boundingBox;
-          if (bbox && videoRef.current && videoRef.current.videoWidth) {
-            const normW = bbox.width / videoRef.current.videoWidth;
-            const normH = bbox.height / videoRef.current.videoHeight;
-            if (normW * normH < 0.035) return false; // Ignore small poster drawings
-          }
-          return true;
+        totalPeople = countPeople({
+          faceCount: currentFaces,
+          detections: objectResults.detections,
+          frameWidth: videoRef.current ? videoRef.current.videoWidth : 0,
+          frameHeight: videoRef.current ? videoRef.current.videoHeight : 0,
         });
-        totalPeople = Math.max(currentFaces, persons.length);
 
         const nowObj = performance.now();
         const forbiddenObjects = objectResults.detections.filter(d => ['cell phone', 'laptop', 'book', 'tablet'].includes(d.categories[0].categoryName));
@@ -1101,45 +1104,59 @@ function CandidatePortal({ directQA = false }) {
       }
 
       const now = performance.now();
-      if (now - lastWarningTimeRef.current > 2500) {
-        if (currentHands > 2) {
+
+      // Each condition is evaluated INDEPENDENTLY with its own tracker.
+      // Previously these were an if/else-if chain sharing one cooldown, so a
+      // missing face suppressed multi-person detection entirely and any single
+      // warning silenced every other detector for the cooldown window.
+
+      // Extra hands = someone else reaching into frame.
+      if (currentHands > 2) {
+        if (now - lastWarningTimeRef.current > 2500) {
           hasAdditionalPersonRef.current = true;
           setHasAdditionalPersonDetected(true);
           setWarningsCount(prev => prev + 1);
-          if (isCameraCheckPhaseRef.current) {
-            recordProctoringEvent("360_SCAN_ADDITIONAL_PERSON_DETECTED");
-          } else {
-            recordProctoringEvent("EXTRA_HANDS");
-          }
+          recordProctoringEvent(
+            isCameraCheckPhaseRef.current
+              ? "360_SCAN_ADDITIONAL_PERSON_DETECTED"
+              : "EXTRA_HANDS"
+          );
           lastWarningTimeRef.current = now;
-        } else if (totalPeople === 0) {
-          // During the 360° environment scan phase (isCameraCheckPhaseRef.current = true),
-          // face being absent is EXPECTED and REQUIRED — candidate is rotating camera away.
-          // Do NOT mark as failed when face is gone during scan.
-          if (!isCameraCheckPhaseRef.current) {
-            setWarningsCount(prev => prev + 1);
-            recordProctoringEvent("FACE_NOT_DETECTED");
-            lastWarningTimeRef.current = now;
-          }
-        } else if (totalPeople > 1) {
-          hasAdditionalPersonRef.current = true;
-          setHasAdditionalPersonDetected(true);
-          setWarningsCount(prev => prev + 1);
-          if (isCameraCheckPhaseRef.current) {
-            recordProctoringEvent("360_SCAN_ADDITIONAL_PERSON_DETECTED");
-          } else {
-            recordProctoringEvent("MULTIPLE_FACES");
-          }
-          lastWarningTimeRef.current = now;
-        } else if (results.faceLandmarks && results.faceLandmarks.length > 0) {
-          // Basic out of frame check (nose too close to extreme edges)
-          const nose = results.faceLandmarks[0][1];
-          if (nose.x < 0.03 || nose.x > 0.97 || nose.y < 0.03 || nose.y > 0.97) {
-            setWarningsCount(prev => prev + 1);
-            recordProctoringEvent("FACE_OUT_OF_FRAME");
-            lastWarningTimeRef.current = now;
-          }
         }
+      }
+
+      // Candidate absent. During the 360 scan the face is EXPECTED to leave
+      // frame, so this is only enforced during the interview itself.
+      const faceMissing = totalPeople === 0 && !isCameraCheckPhaseRef.current;
+      if (noFaceTrackerRef.current.update(faceMissing, now)) {
+        setWarningsCount(prev => prev + 1);
+        recordProctoringEvent("FACE_NOT_DETECTED");
+      }
+
+      // More than one person in frame.
+      if (multiFaceTrackerRef.current.update(totalPeople > 1, now)) {
+        hasAdditionalPersonRef.current = true;
+        setHasAdditionalPersonDetected(true);
+        setWarningsCount(prev => prev + 1);
+        recordProctoringEvent(
+          isCameraCheckPhaseRef.current
+            ? "360_SCAN_ADDITIONAL_PERSON_DETECTED"
+            : "MULTIPLE_FACES"
+        );
+      }
+
+      // Candidate drifting out of the camera frame.
+      const primaryFace =
+        results.faceLandmarks && results.faceLandmarks.length > 0
+          ? results.faceLandmarks[0]
+          : null;
+      const outOfFrame =
+        !isCameraCheckPhaseRef.current &&
+        totalPeople === 1 &&
+        isFaceOutOfFrame(primaryFace);
+      if (outOfFrameTrackerRef.current.update(outOfFrame, now)) {
+        setWarningsCount(prev => prev + 1);
+        recordProctoringEvent("FACE_OUT_OF_FRAME");
       }
 
       // BACKGROUND VOICE DETECTION - Noise-Ignoring Implementation
@@ -1173,6 +1190,7 @@ function CandidatePortal({ directQA = false }) {
       }
 
       let isMouthMoving = false;
+      let isEyesWandering = false;
       if (results.faceBlendshapes && results.faceBlendshapes.length > 0) {
         const shapes = results.faceBlendshapes[0].categories;
         const jawOpen = shapes.find(c => c.categoryName === 'jawOpen');
@@ -1181,115 +1199,63 @@ function CandidatePortal({ directQA = false }) {
           isMouthMoving = true;
         }
 
-        // ENTERPRISE CALIBRATED DUAL-MODE EYE TRACKING (Blendshapes + Dual Iris Pupil Landmarks)
-        // Calibrated thresholds: blendshape 0.82 instead of 0.75 to reduce false positives while reading
-        // Iris: dual-eye check with 0.18-0.82 horizontal and 0.15-0.85 vertical calibration
+        // Gaze tracking. Blendshapes are a fast first signal; the iris
+        // geometry check in detectGazeAway() then confirms it, requiring BOTH
+        // eyes to agree so single-eye landmark jitter cannot cause a warning.
         const eyeKeys = ['eyeLookInLeft', 'eyeLookOutLeft', 'eyeLookUpLeft', 'eyeLookDownLeft', 'eyeLookInRight', 'eyeLookOutRight', 'eyeLookUpRight', 'eyeLookDownRight'];
-        let isEyesWandering = eyeKeys.some(key => {
+        const blendshapeSuggestsAway = eyeKeys.some(key => {
           const shape = shapes.find(c => c.categoryName === key);
-          return shape && shape.score > 0.82; // Calibrated 0.82 gaze threshold - only true off-screen gaze triggers, reading is ignored
+          return shape && shape.score > 0.82;
         });
 
-        // Calibrated Iris Pupil Landmark Tracking - Dual Eye + Vertical
-        if (!isEyesWandering && results.faceLandmarks && results.faceLandmarks.length > 0) {
-          const landmarks = results.faceLandmarks[0];
-          if (landmarks && landmarks.length > 473) {
-            const checkEye = (pupilIdx, innerIdx, outerIdx, topIdx, bottomIdx) => {
-              const pupil = landmarks[pupilIdx];
-              const inner = landmarks[innerIdx];
-              const outer = landmarks[outerIdx];
-              if (!pupil || !inner || !outer) return false;
-              const eyeWidth = Math.abs(outer.x - inner.x);
-              if (eyeWidth < 0.01) return false;
-              const hRatio = Math.abs(pupil.x - inner.x) / eyeWidth;
-              // Calibrated horizontal: <0.18 or >0.82 = true off-screen, 0.18-0.82 = normal reading range
-              if (hRatio < 0.18 || hRatio > 0.82) return true;
-              // Calibrated vertical check
-              if (topIdx && bottomIdx) {
-                const top = landmarks[topIdx];
-                const bottom = landmarks[bottomIdx];
-                if (top && bottom) {
-                  const eyeHeight = Math.abs(bottom.y - top.y);
-                  if (eyeHeight > 0.001) {
-                    const vRatio = (pupil.y - top.y) / eyeHeight;
-                    if (vRatio < 0.15 || vRatio > 0.85) return true;
-                  }
-                }
-              }
-              return false;
-            };
-            // Left eye: 468 pupil, 133 inner, 33 outer, 159 top, 145 bottom
-            // Right eye: 473 pupil, 362 inner, 263 outer, 386 top, 374 bottom
-            if (checkEye(468, 133, 33, 159, 145) || checkEye(473, 362, 263, 386, 374)) {
-              isEyesWandering = true;
-            }
-          }
-        }
+        const primaryLandmarks =
+          results.faceLandmarks && results.faceLandmarks.length > 0
+            ? results.faceLandmarks[0]
+            : null;
+        const gaze = detectGazeAway(primaryLandmarks);
 
-        if (isEyesWandering) {
-          eyesWanderingCountRef.current += 1;
-        } else {
-          eyesWanderingCountRef.current = Math.max(0, eyesWanderingCountRef.current - 3); // Quick decay on natural gaze
-        }
+        // Blendshapes alone are noisy, so require geometric confirmation
+        // unless the blendshape signal is unavailable.
+        isEyesWandering = gaze.away || (blendshapeSuggestsAway && gaze.reason === 'no-landmarks');
       }
 
-      // HIGH-PRECISION HEAD TURN TRACKING
+      // HEAD POSE TRACKING (yaw + pitch)
       let isHeadTurned = false;
-      if (results.faceLandmarks && results.faceLandmarks.length > 0) {
-        // Head tracking based on relative position of nose to ears
-        const nose = results.faceLandmarks[0][1];
-        const leftEar = results.faceLandmarks[0][234];
-        const rightEar = results.faceLandmarks[0][454];
-
-        if (nose && leftEar && rightEar) {
-          const distLeft = Math.abs(nose.x - leftEar.x);
-          const distRight = Math.abs(nose.x - rightEar.x);
-          // Head turn ratio (detects turning head completely away from monitor > 2.2)
-          if (distLeft / distRight > 2.2 || distRight / distLeft > 2.2) {
-            isHeadTurned = true;
-          }
+      {
+        const primaryLandmarks =
+          results.faceLandmarks && results.faceLandmarks.length > 0
+            ? results.faceLandmarks[0]
+            : null;
+        if (primaryLandmarks) {
+          isHeadTurned = detectHeadTurned(primaryLandmarks).turned;
         }
       }
 
-      if (isHeadTurned) {
-        headTurnCountRef.current += 1;
-      } else {
-        headTurnCountRef.current = Math.max(0, headTurnCountRef.current - 3);
-      }
-
-      // Noise-filtered: only confirmed human voice (SpeechRecognition) triggers background voice, not ambient noise
-      if (isConfirmedHumanVoice && !isMouthMoving && !window.isAgentSpeaking) {
-        backgroundVoiceCountRef.current += 1;
-      } else {
-        backgroundVoiceCountRef.current = Math.max(0, backgroundVoiceCountRef.current - 3); // Faster decay to ignore transient noise
-      }
-
-      // Require sustained confirmed speech (approx 2 seconds) to trigger, ignoring pure noise
-      if (backgroundVoiceCountRef.current > 28 && now - lastWarningTimeRef.current > 7000) {
+      // Background voice: only confirmed human speech counts, never ambient
+      // noise (fans, AC, typing, traffic).
+      const backgroundVoice = isConfirmedHumanVoice && !isMouthMoving && !window.isAgentSpeaking;
+      if (voiceTrackerRef.current.update(backgroundVoice, now)) {
         if (isCameraCheckPhaseRef.current) {
           isPreCheckFailedRef.current = "Environment scan failed: Background voices detected. You must be in a quiet environment.";
         } else {
           setWarningsCount(prev => prev + 1);
           recordProctoringEvent("BACKGROUND_VOICE");
-          lastWarningTimeRef.current = now;
-          backgroundVoiceCountRef.current = 0;
         }
       }
 
-      // Flag wandering eyes (Sustained off-screen gaze deviation > 45 frames, 5s cooldown)
-      if (eyesWanderingCountRef.current > 45 && now - lastWarningTimeRef.current > 5000) {
-        setWarningsCount(prev => prev + 1);
-        recordProctoringEvent("EYES_WANDERING");
-        lastWarningTimeRef.current = now;
-        eyesWanderingCountRef.current = 0;
-      }
+      // Gaze and head pose. Each tracker owns its own cooldown, so a head turn
+      // no longer suppresses an unrelated gaze warning (they previously shared
+      // a single lastWarningTimeRef and masked one another).
+      if (!isCameraCheckPhaseRef.current) {
+        if (gazeTrackerRef.current.update(isEyesWandering, now)) {
+          setWarningsCount(prev => prev + 1);
+          recordProctoringEvent("EYES_WANDERING");
+        }
 
-      // Flag head turn (Sustained off-screen head turn > 45 frames, 5s cooldown)
-      if (headTurnCountRef.current > 45 && now - lastWarningTimeRef.current > 5000) {
-        setWarningsCount(prev => prev + 1);
-        recordProctoringEvent("HEAD_TURNED");
-        lastWarningTimeRef.current = now;
-        headTurnCountRef.current = 0;
+        if (headTrackerRef.current.update(isHeadTurned, now)) {
+          setWarningsCount(prev => prev + 1);
+          recordProctoringEvent("HEAD_TURNED");
+        }
       }
     }
 
@@ -1456,7 +1422,9 @@ function CandidatePortal({ directQA = false }) {
     if (isFirstQuestionStartedRef.current !== undefined) isFirstQuestionStartedRef.current = false;
     setWarningsCount(0);
     proctoringEvents.current = [];
-    backgroundVoiceCountRef.current = 0;
+    [gazeTrackerRef, headTrackerRef, voiceTrackerRef,
+     noFaceTrackerRef, multiFaceTrackerRef, outOfFrameTrackerRef]
+      .forEach(ref => ref.current.reset());
     setShowCamera(true);
   };
 

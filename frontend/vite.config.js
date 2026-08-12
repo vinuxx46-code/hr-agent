@@ -7,6 +7,9 @@ export default defineConfig({
   plugins: [react()],
   server: {
     host: '0.0.0.0',
+    // Hosted sandbox previews are served from a *.e2b.app subdomain, which
+    // Vite blocks by default as a DNS-rebinding protection.
+    allowedHosts: ['.e2b.app', 'localhost', '127.0.0.1'],
     proxy: {
       '/api': { target: 'http://127.0.0.1:8000', changeOrigin: true },
       '/recordings': { target: 'http://127.0.0.1:8000', changeOrigin: true },

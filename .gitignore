@@ -1,0 +1,11 @@
+.env
+package-lock.json
+resume.zip
+node_modules/
+venv
+backend/venv
+frontend/node_modules
+temp_resumes/
+resume/
+backend/.env
+backend\__pycache__ copy/

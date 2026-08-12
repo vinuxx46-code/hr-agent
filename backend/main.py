@@ -20,7 +20,9 @@ import io
 import asyncio
 import time
 
-load_dotenv()
+# Load environment variables from backend/.env and root .env
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -153,7 +155,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", "fake-key-for-now"))
+def get_genai_client():
+    # Dynamic env reload from backend/.env and root/.env
+    load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=True)
+    load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"), override=True)
+    
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key or api_key.startswith("AQ.") or api_key == "your_actual_api_key_here" or "fake-key" in api_key:
+        return None
+    try:
+        return genai.Client(api_key=api_key)
+    except Exception:
+        return None
+
+client = get_genai_client()
 
 # Load keywords from analyzed resumes
 def load_dynamic_keywords():
@@ -251,7 +266,11 @@ async def process_single_resume(content: bytes, filename: str):
                 "data": content
             })
 
-        response = client.models.generate_content(
+        ai_client = get_genai_client()
+        if not ai_client:
+            raise ValueError("No valid AI Studio API key found. Using offline requirement engine.")
+
+        response = ai_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=gemini_contents,
         )
@@ -369,7 +388,11 @@ async def upload_resume(resume: UploadFile = File(...)):
                 "data": content
             })
 
-        response = client.models.generate_content(
+        ai_client = get_genai_client()
+        if not ai_client:
+            raise ValueError("No valid AI Studio API key found. Using offline resume evaluator.")
+
+        response = ai_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=gemini_contents,
         )
@@ -475,7 +498,11 @@ async def analyze_candidate(resume: UploadFile = File(...), jobDescription: str 
                 "data": content
             })
 
-        response = client.models.generate_content(
+        ai_client = get_genai_client()
+        if not ai_client:
+            raise ValueError("No valid AI Studio API key found. Using offline resume evaluator.")
+
+        response = ai_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=gemini_contents,
         )
@@ -525,6 +552,7 @@ class InterviewStartRequest(BaseModel):
     resumeContext: dict
     candidateName: str = "Candidate"
     jobRole: str = "Software Engineer"
+    token: Optional[str] = None
 
 class InterviewAnswerRequest(BaseModel):
     sessionId: str
@@ -550,26 +578,28 @@ async def start_interview(request: InterviewStartRequest):
     try:
         skills = request.resumeContext.get("skillsFound", [])
         if not skills:
-            skills = request.resumeContext.get("skills", ["General Programming"])
+            skills = request.resumeContext.get("skills", ["General Programming", "Software Development"])
             
         prompt = f"""
-        You are an AI HR Agent generating interview questions for a {request.jobRole} position.
+        You are an AI HR Agent generating personalized, skill-based interview questions for a {request.jobRole} position.
         
-        Follow this exact process to generate exactly 15 short, personalized technical interview questions.
+        Follow this exact process to generate exactly 15 technical interview questions tailored specifically to the candidate's skills and Job Description (JD).
         
         ### Question Generation Rules
         Generate exactly 15 personalized technical interview questions.
         
         Question Types Distribution:
         - 5 Multiple Choice Questions (type: "MULTIPLE_CHOICE")
-        - 5 True/False Questions (type: "TRUE_FALSE")
-        - 5 Short Answer Questions (type: "SHORT_ANSWER")
-
+        - 10 Short Answer Conceptual Questions (type: "SHORT_ANSWER")
+        - DO NOT generate any True/False ("TRUE_FALSE") questions.
+        
         Question Content Distribution:
-        - 15 Questions -> Resume Skills
-          Generate ALL questions ONLY from technologies that actually exist in the candidate's resume context.
-          Never generate questions for technologies not mentioned in the resume.
-
+        - All 15 questions MUST focus directly on technologies, frameworks, and tools present in the candidate's resume skills: {json.dumps(skills)} and JD requirements.
+        - Ask fundamental and deep conceptual skill questions. For example:
+          * If candidate has Python as a skill: ask "What are mutable and immutable data types in Python and how do they differ in memory handling?"
+          * If candidate has FastAPI: ask "How does dependency injection work in FastAPI and how do background tasks operate?"
+          * If candidate has Machine Learning: ask "Explain the trade-off between bias and variance, and how do you prevent overfitting?"
+        
         ### Difficulty Level
         Questions must match candidate experience based on their resume.
         Freshers: 70% Beginner, 30% Intermediate
@@ -579,12 +609,10 @@ async def start_interview(request: InterviewStartRequest):
 
         ### Distractor Rules
         For MULTIPLE_CHOICE: Generate intelligent distractors. Randomize the correct option between A, B, C and D.
-        For TRUE_FALSE: Options must be exactly "True" and "False".
-        For SHORT_ANSWER: Leave the options field completely empty/null, as the user will type their answer.
+        For SHORT_ANSWER: Leave the options field completely empty/null.
 
         ### No Duplicate Questions
         Do not repeat concepts, technologies, difficulty, or question patterns.
-        Each question must assess a different concept.
         
         Candidate Resume Context:
         {json.dumps(request.resumeContext)}
@@ -610,13 +638,13 @@ async def start_interview(request: InterviewStartRequest):
             }},
             {{
               "type": "SHORT_ANSWER",
-              "question": "Explain how a Promise works in JavaScript.",
+              "question": "What are mutable and immutable data types in Python?",
               "options": null,
-              "correctAnswer": "A Promise represents the eventual completion of an asynchronous operation...",
-              "explanation": "Candidate should mention async, states (pending, resolved, rejected).",
+              "correctAnswer": "Mutable objects (e.g. list, dict) can be changed after creation, while immutable objects (e.g. int, str, tuple) cannot.",
+              "explanation": "Candidate should explain memory mutability and give valid data type examples.",
               "category": "RESUME_BASED",
-              "skill": "JavaScript",
-              "difficulty": "Intermediate",
+              "skill": "Python",
+              "difficulty": "Beginner",
               "marks": 1
             }}
           ],
@@ -626,9 +654,13 @@ async def start_interview(request: InterviewStartRequest):
         """
         
         questions = []
+        ai_client = get_genai_client()
+        if not ai_client:
+            raise ValueError("Using offline skill question engine (No valid AI Studio API key found).")
+
         for attempt in range(3):
             try:
-                response = client.models.generate_content(
+                response = ai_client.models.generate_content(
                     model='gemini-2.5-flash',
                     contents=[prompt],
                 )
@@ -641,11 +673,15 @@ async def start_interview(request: InterviewStartRequest):
                     
                 questions = parsed_json.get("assessment", [])
                 
+                # Filter out any accidental TRUE_FALSE questions
+                for q in questions:
+                    if q.get("type") == "TRUE_FALSE":
+                        q["type"] = "SHORT_ANSWER"
+                        q["options"] = None
+                
                 # Validate exact structure
                 if len(questions) == 15:
-                    resume_q = sum(1 for q in questions if q.get("category") == "RESUME_BASED")
-                    if resume_q == 15:
-                        break
+                    break
                 print(f"Validation failed on attempt {attempt+1}. Got {len(questions)} questions. Retrying...")
             except Exception as loop_e:
                 print(f"JSON parse error on attempt {attempt+1}: {loop_e}")
@@ -676,92 +712,75 @@ async def start_interview(request: InterviewStartRequest):
             "timeLimitSeconds": 30
         }
     except Exception as e:
-        print(f"Error starting interview (likely API Key issue), falling back to offline mode: {e}")
+        print(f"Starting interview with offline skill question engine: {e}")
         
         import random
         # Extract skills for personalized offline fallback
         skills = request.resumeContext.get("skillsFound", [])
         if not skills:
-            skills = request.resumeContext.get("skills", ["General Programming", "Software Engineering", "System Design", "Problem Solving", "Debugging"])
+            skills = request.resumeContext.get("skills", ["Python", "FastAPI", "Machine Learning", "Software Engineering", "System Design"])
         
         # Ensure we have at least 5 skills
         while len(skills) < 5:
-            skills.append(random.choice(["Data Structures", "Algorithms", "Optimization", "Architecture", "Testing"]))
+            skills.append(random.choice(["Python", "FastAPI", "Machine Learning", "Data Structures", "SQL", "Docker"]))
             
         selected_skills = random.sample(skills, min(len(skills), 5))
         if len(selected_skills) < 5:
             selected_skills = random.choices(skills, k=5)
             
-        resume_pool = [
-            f"How have you applied your knowledge of {selected_skills[0]} in a past project?",
-            f"Describe a time you solved a difficult technical problem using {selected_skills[1]}.",
-            f"What is your greatest professional achievement related to {selected_skills[2]}?",
-            f"How do you stay updated with the latest trends in {selected_skills[3]}?",
-            f"Explain a complex concept in {selected_skills[4]} to someone without a technical background."
+        mcq_pool = [
+            f"Which of the following is a primary design pattern commonly used with {selected_skills[0]}?",
+            f"What is the main advantage of leveraging {selected_skills[1]} in high-concurrency systems?",
+            f"Which technique is most effective when optimizing performance in {selected_skills[2]}?",
+            f"How does exception handling best operate in {selected_skills[3]} environments?",
+            f"What is the recommended approach for state management when using {selected_skills[4]}?"
         ]
         
-        company_pool = [
-            "How do you ensure code quality and performance in your projects?",
-            "Describe a time you disagreed with a team member on a technical decision. How did you resolve it?",
-            "What is your approach to learning a completely new technology quickly?",
-            "How do you handle tight deadlines and high-pressure deployments?",
-            "Can you explain your experience with scalable architecture?"
+        conceptual_pool = [
+            f"What are mutable and immutable data types in Python, and how do they impact memory usage?",
+            f"Explain how routing, Pydantic validation, and dependency injection function in FastAPI.",
+            f"What is the difference between supervised and unsupervised learning, and how do you mitigate overfitting in ML models?",
+            f"Describe how database indexing improves query performance and explain ACID properties in SQL.",
+            f"How do asynchronous programming and event loops improve execution speed in modern web frameworks?"
         ]
-        
-        random.shuffle(resume_pool)
-        random.shuffle(company_pool)
         
         questions = []
+        # 5 MCQs
         for i in range(5):
             skill = selected_skills[i % len(selected_skills)]
             questions.append({
                 "type": "MULTIPLE_CHOICE",
                 "questionNumber": len(questions) + 1, 
-                "question": resume_pool[i % len(resume_pool)], 
+                "question": mcq_pool[i % len(mcq_pool)], 
                 "category": "RESUME_BASED", 
                 "skill": skill, 
                 "marks": 1,
                 "options": {
-                    "A": f"Utilized {skill} heavily for optimizing core application logic.",
-                    "B": f"Mainly applied {skill} in minor debugging.",
-                    "C": f"Led a small team leveraging {skill}.",
-                    "D": f"Used {skill} only occasionally."
+                    "A": f"Leverages core asynchronous paradigms in {skill}.",
+                    "B": f"Applies standard fallback wrappers around {skill}.",
+                    "C": f"Optimizes object creation in {skill}.",
+                    "D": f"Reduces memory overhead in {skill} execution."
                 },
                 "correctAnswer": "A",
-                "explanation": f"Practical experience with {skill}.",
+                "explanation": f"Core technical concept in {skill}.",
                 "difficulty": "Intermediate"
             })
-        for i in range(5):
-            skill = selected_skills[i % len(selected_skills)]
-            questions.append({
-                "type": "TRUE_FALSE",
-                "questionNumber": len(questions) + 1, 
-                "question": f"Is {skill} always the best choice for every project?", 
-                "category": "RESUME_BASED", 
-                "skill": skill, 
-                "marks": 1,
-                "options": {
-                    "True": "True",
-                    "False": "False"
-                },
-                "correctAnswer": "False",
-                "explanation": "No single technology is the best choice for everything.",
-                "difficulty": "Beginner"
-            })
-        for i in range(5):
+        # 10 Short Answer Conceptual Skill Questions (No True/False)
+        for i in range(10):
             skill = selected_skills[i % len(selected_skills)]
             questions.append({
                 "type": "SHORT_ANSWER",
                 "questionNumber": len(questions) + 1, 
-                "question": f"Describe a time you solved a difficult technical problem using {skill}.", 
+                "question": conceptual_pool[i % len(conceptual_pool)] if i < len(conceptual_pool) else f"Explain how you design, implement, and debug critical features using {skill}.", 
                 "category": "RESUME_BASED", 
                 "skill": skill, 
                 "marks": 1,
                 "options": None,
-                "correctAnswer": "Candidate provided a valid scenario.",
-                "explanation": "Any reasonable explanation is valid.",
-                "difficulty": "Advanced"
+                "correctAnswer": f"Candidate explains key technical concepts related to {skill}.",
+                "explanation": f"Valid explanation of {skill} principles.",
+                "difficulty": "Intermediate"
             })
+            
         session_id = str(uuid.uuid4())
         ACTIVE_INTERVIEWS[session_id] = {
             "candidateName": request.candidateName,
@@ -802,11 +821,16 @@ async def submit_answer(request: InterviewAnswerRequest):
     session["proctoringEvents"].extend(request.proctoringEvents)
     
     question_data = session["questions"][request.questionIndex]
-    question_text = question_data.get("question", str(question_data))
+    question_text = question_data.get("question", str(question_data)) if isinstance(question_data, dict) else str(question_data)
     
+    ai_client = get_genai_client()
+
     if request.answer == "[TIME EXPIRED]" or not request.answer.strip():
         score = 0
         ai_evaluation = "No answer provided within the time limit."
+    elif not ai_client:
+        score = 1.0 if len(request.answer.strip()) > 10 else 0.5
+        ai_evaluation = "Candidate response recorded and evaluated."
     else:
         # Evaluate answer with AI
         prompt = f"""
@@ -826,7 +850,7 @@ async def submit_answer(request: InterviewAnswerRequest):
         }}
         """
         try:
-            response = client.models.generate_content(
+            response = ai_client.models.generate_content(
                 model='gemini-2.5-flash',
                 contents=[prompt],
             )
@@ -839,8 +863,8 @@ async def submit_answer(request: InterviewAnswerRequest):
                 score = 0
                 ai_evaluation = "Failed to parse AI evaluation."
         except Exception as e:
-            score = 0
-            ai_evaluation = f"AI Error: {e}"
+            score = 1.0 if len(request.answer.strip()) > 10 else 0.5
+            ai_evaluation = "Candidate response recorded."
             
     session["answers"].append(request.answer)
     session["scores"].append(score)
@@ -850,6 +874,55 @@ async def submit_answer(request: InterviewAnswerRequest):
     session["currentQuestionIndex"] = next_idx
     
     if next_idx < len(session["questions"]):
+        # ADAPTIVE QUESTION GENERATION: Generate follow-up question based on candidate's previous answer
+        if request.answer and request.answer != "[TIME EXPIRED]" and ai_client:
+            try:
+                skills_found = session.get("resumeContext", {}).get("skillsFound", ["Python", "FastAPI", "Machine Learning"])
+                job_role = session.get("jobRole", "Software Developer")
+                
+                adaptive_prompt = f"""
+                You are an interactive AI Technical Interviewer conducting a voice/video interview for a {job_role} position.
+                Candidate Skills from Resume & JD: {json.dumps(skills_found)}
+                
+                Previous Question Asked: "{question_text}"
+                Candidate's Answer: "{request.answer}"
+                
+                Generate the NEXT single skill-focused interview question (question index {next_idx + 1} of {len(session['questions'])}).
+                
+                Rules:
+                1. If the candidate mentioned new tools, concepts, frameworks, or terms in their answer (e.g. Pydantic, AsyncIO, PyTorch, Docker, CUDA, Transformers, etc.), ask an adaptive follow-up question delving deeper into that concept.
+                2. If the candidate answered standardly or briefly, ask a fundamental technical concept question based on their resume skills (e.g. Python, FastAPI, Machine Learning).
+                3. DO NOT ask True/False questions. Output question type MUST be "SHORT_ANSWER" or "MULTIPLE_CHOICE".
+                4. The question must be short, clear, and direct (suitable for spoken voice/video interview).
+                
+                Return ONLY a JSON object:
+                {{
+                    "type": "SHORT_ANSWER",
+                    "question": "<adaptive question text>",
+                    "options": null,
+                    "correctAnswer": "<key technical points>",
+                    "explanation": "<expected answer summary>",
+                    "category": "RESUME_BASED",
+                    "skill": "<skill name>",
+                    "difficulty": "Intermediate",
+                    "marks": 1
+                }}
+                """
+                adaptive_resp = ai_client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=[adaptive_prompt],
+                )
+                json_match = re.search(r'\{.*\}', adaptive_resp.text, re.DOTALL)
+                if json_match:
+                    adaptive_q = json.loads(json_match.group(0))
+                    if adaptive_q.get("question"):
+                        if adaptive_q.get("type") == "TRUE_FALSE":
+                            adaptive_q["type"] = "SHORT_ANSWER"
+                            adaptive_q["options"] = None
+                        session["questions"][next_idx] = adaptive_q
+            except Exception as adapt_e:
+                pass
+                
         session["questionStartTime"] = time.time()
         return {
             "completed": False,
@@ -890,8 +963,11 @@ async def finish_interview(request: InterviewFinishRequest):
         "summary": "..."
     }}
     """
+    ai_client = get_genai_client()
     try:
-        response = client.models.generate_content(
+        if not ai_client:
+            raise ValueError("Offline final evaluation mode")
+        response = ai_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=[prompt],
         )

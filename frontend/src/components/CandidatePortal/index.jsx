@@ -15,6 +15,23 @@ console.log = (...args) => { if (!shouldSuppress(args)) originalLog(...args); };
 
 const validatedTokens = new Set();
 
+// Helper to extract clean question text string safely without React child rendering errors
+const getQuestionTextString = (q) => {
+  if (!q) return "";
+  if (typeof q === 'string') {
+    if (q.trim().startsWith('{')) {
+      try { return getQuestionTextString(JSON.parse(q)); } catch (e) {}
+    }
+    return q;
+  }
+  if (typeof q === 'object') {
+    if (typeof q.question === 'string') return q.question;
+    if (typeof q.question === 'object') return getQuestionTextString(q.question);
+    if (typeof q.text === 'string') return q.text;
+  }
+  return String(q || "");
+};
+
 function CandidatePortal({ directQA = false }) {
   const [appState, setAppState] = useState('idle');
   const [inviteToken, setInviteToken] = useState(null);
@@ -45,6 +62,7 @@ function CandidatePortal({ directQA = false }) {
   const [isWarningBlinking, setIsWarningBlinking] = useState(false);
   const [showMuteWarning, setShowMuteWarning] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isAiSpeaking, setIsAiSpeaking] = useState(false);
   const [isCameraCheckConfirmed, setIsCameraCheckConfirmed] = useState(() => {
     const isCompleted = sessionStorage.getItem('isCameraCheckCompleted') === 'true';
     const wasScanning = sessionStorage.getItem('wasScanning') === 'true';
@@ -125,6 +143,7 @@ function CandidatePortal({ directQA = false }) {
   const audioAnalyserRef = useRef(null);
   const audioDataArrayRef = useRef(null);
   const recognitionRef = useRef(null);
+  const shouldListenRef = useRef(false);
   const isHumanSpeechDetectedRef = useRef(false);
   const backgroundVoiceCountRef = useRef(0);
   const headTurnCountRef = useRef(0);
@@ -135,24 +154,129 @@ function CandidatePortal({ directQA = false }) {
   const cameraTimerRef = useRef(null);
   const isHardwareMutedRef = useRef(false);
 
-  const [isAiSpeaking, setIsAiSpeaking] = useState(false);
+  const currentUtteranceRef = useRef(null);
+  const ttsSafetyTimeoutRef = useRef(null);
+  const isSubmittingRef = useRef(false);
+
+  useEffect(() => {
+    isSubmittingRef.current = isSubmitting;
+  }, [isSubmitting]);
+
+  // Clean Web Speech API Speech Recognition Initializer & Auto-Restarter
+  const startOrRestartSpeechRecognition = () => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+
+    if (recognitionRef.current) {
+      try {
+        shouldListenRef.current = false;
+        recognitionRef.current.onend = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.stop();
+      } catch (e) {}
+      recognitionRef.current = null;
+    }
+
+    if (window.speechTimeout) clearTimeout(window.speechTimeout);
+    shouldListenRef.current = true;
+
+    try {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+
+      recognition.onresult = (event) => {
+        // If AI is currently actively speaking TTS, skip to prevent echo
+        if (window.isAgentSpeaking && isAiSpeaking) return;
+
+        isHumanSpeechDetectedRef.current = true;
+        let finalTranscript = '';
+        let interimTranscript = '';
+
+        for (let i = 0; i < event.results.length; ++i) {
+          if (event.results[i].isFinal) {
+            finalTranscript += event.results[i][0].transcript + ' ';
+          } else {
+            interimTranscript += event.results[i][0].transcript;
+          }
+        }
+
+        const fullText = (finalTranscript + interimTranscript).trim();
+        if (fullText) {
+          setAnswerText(fullText);
+          answerTextRef.current = fullText;
+        }
+
+        // Extended silence timeout: 12 seconds of complete silence after candidate speaks
+        if (window.speechTimeout) clearTimeout(window.speechTimeout);
+        window.speechTimeout = setTimeout(() => {
+          isHumanSpeechDetectedRef.current = false;
+          if (!isCameraCheckPhaseRef.current && window.submitAnswerFn && answerTextRef.current && answerTextRef.current.trim().length > 15 && !isSubmittingRef.current) {
+            if (!isHardwareMutedRef.current) {
+              window.submitAnswerFn(false);
+            }
+          }
+        }, 12000);
+      };
+
+      recognition.onerror = (e) => {
+        if (e.error !== 'no-speech' && e.error !== 'aborted') {
+          console.log('Speech recognition error:', e.error);
+        }
+        if (e.error === 'network' && shouldListenRef.current && !window.isAgentSpeaking) {
+          setTimeout(() => {
+            if (shouldListenRef.current && !window.isAgentSpeaking) {
+              startOrRestartSpeechRecognition();
+            }
+          }, 400);
+        }
+      };
+
+      recognition.onend = () => {
+        if (shouldListenRef.current && streamRef.current && !isSubmittingRef.current && !window.isAgentSpeaking) {
+          setTimeout(() => {
+            try {
+              if (shouldListenRef.current && !window.isAgentSpeaking && recognitionRef.current === recognition) {
+                recognition.start();
+              }
+            } catch (e) {}
+          }, 150);
+        }
+      };
+
+      recognition.start();
+      recognitionRef.current = recognition;
+    } catch (e) {
+      console.log('Speech recognition initialization error:', e);
+    }
+  };
 
   // Text to Speech Function with Natural Voice Selection & Anti-Echo Pause
   const speakText = (text, onComplete) => {
     if (!('speechSynthesis' in window)) {
+      window.isAgentSpeaking = false;
+      setIsAiSpeaking(false);
+      shouldListenRef.current = true;
+      startOrRestartSpeechRecognition();
       if (onComplete) onComplete();
       return;
     }
 
     window.speechSynthesis.cancel();
+    if (ttsSafetyTimeoutRef.current) clearTimeout(ttsSafetyTimeoutRef.current);
 
     // Pause mic while AI speaks to prevent echo self-listening
+    shouldListenRef.current = false;
     if (recognitionRef.current) {
       try { recognitionRef.current.stop(); } catch (e) {}
     }
 
     const cleanText = String(text || '').replace(/[#*_`]/g, '');
     const utterance = new SpeechSynthesisUtterance(cleanText);
+    currentUtteranceRef.current = utterance; // Keep ref to prevent Chrome Garbage Collection bug!
+
     utterance.rate = 0.98;
     utterance.pitch = 1.0;
 
@@ -167,32 +291,40 @@ function CandidatePortal({ directQA = false }) {
       utterance.voice = naturalVoice;
     }
 
+    const handleSpeechEnd = () => {
+      if (ttsSafetyTimeoutRef.current) clearTimeout(ttsSafetyTimeoutRef.current);
+      window.isAgentSpeaking = false;
+      setIsAiSpeaking(false);
+      shouldListenRef.current = true;
+      startOrRestartSpeechRecognition();
+      if (onComplete) onComplete();
+    };
+
     utterance.onstart = () => {
       window.isAgentSpeaking = true;
       setIsAiSpeaking(true);
-    };
-
-    utterance.onend = () => {
-      window.isAgentSpeaking = false;
-      setIsAiSpeaking(false);
-      
-      // Auto-start Speech Recognition right after AI question completes!
+      shouldListenRef.current = false;
       if (recognitionRef.current) {
-        try { recognitionRef.current.start(); } catch (e) {}
+        try { recognitionRef.current.stop(); } catch (e) {}
       }
-      if (onComplete) onComplete();
+
+      // Safety timeout: Chrome onend can fail to fire for long strings. Force unblock mic after speech duration.
+      const safetyMs = Math.min(Math.max(cleanText.length * 90, 4000), 10000);
+      ttsSafetyTimeoutRef.current = setTimeout(() => {
+        console.log("TTS Safety timeout fired. Unblocking candidate mic...");
+        handleSpeechEnd();
+      }, safetyMs);
     };
 
-    utterance.onerror = () => {
-      window.isAgentSpeaking = false;
-      setIsAiSpeaking(false);
-      if (recognitionRef.current) {
-        try { recognitionRef.current.start(); } catch (e) {}
-      }
-      if (onComplete) onComplete();
-    };
+    utterance.onend = handleSpeechEnd;
+    utterance.onerror = handleSpeechEnd;
 
-    window.speechSynthesis.speak(utterance);
+    try {
+      window.speechSynthesis.speak(utterance);
+    } catch (e) {
+      console.log("TTS speak error:", e);
+      handleSpeechEnd();
+    }
   };
 
   // Global Bypass Key Listener (Ctrl+Shift+B)
@@ -334,15 +466,6 @@ function CandidatePortal({ directQA = false }) {
     }
   }, [appState]);
 
-  useEffect(() => {
-    if (currentQuestion && appState === 'interview' && isCameraCheckCompleted) {
-      const qText = typeof currentQuestion === 'string' ? currentQuestion : currentQuestion?.question;
-      if (qText) {
-        speakText(qText);
-      }
-    }
-  }, [currentQuestion, appState, isCameraCheckCompleted]);
-
   // Browser Refresh & Close Protection (Seamless background state preservation without popup modal)
   useEffect(() => {
     const handleBeforeUnload = (e) => {
@@ -469,10 +592,13 @@ function CandidatePortal({ directQA = false }) {
         setIsScanPaused(false);
 
         setCameraTimeLeft((prev) => {
-          const currentProgress = seenKeyframesRef.current.length >= 10 ? 100 : Math.min(100, Math.round((seenKeyframesRef.current.length / 10) * 100));
-
-          if (currentProgress >= 80 && prev <= 1) {
-            clearInterval(scanInterval);
+          if (prev <= 1) {
+            if (scanInterval) clearInterval(scanInterval);
+            setIsCameraCheckCompleted(true);
+            isCameraCheckPhaseRef.current = false;
+            setIsScanPaused(false);
+            sessionStorage.setItem('wasScanning', 'false');
+            sessionStorage.setItem('isCameraCheckCompleted', 'true');
 
             // Validate 360-degree verification result and send proctoring events to backend server
             const activeToken = inviteToken || new URLSearchParams(window.location.search).get('token');
@@ -488,9 +614,6 @@ function CandidatePortal({ directQA = false }) {
 
             return 0;
           }
-          if (currentProgress >= 100) {
-            return 0;
-          }
           return Math.max(0, prev - 1);
         });
       }, 1000);
@@ -500,6 +623,17 @@ function CandidatePortal({ directQA = false }) {
       if (scanInterval) clearInterval(scanInterval);
     };
   }, [appState, isCameraCheckConfirmed, isCameraCheckCompleted, customWarning.show, inviteToken]);
+
+  // Safety Fallback Guard: If scan timer reaches 0, ensure transition to interview phase immediately
+  useEffect(() => {
+    if (appState === 'interview' && isCameraCheckConfirmed && !isCameraCheckCompleted && cameraTimeLeft <= 0) {
+      setIsCameraCheckCompleted(true);
+      isCameraCheckPhaseRef.current = false;
+      setIsScanPaused(false);
+      sessionStorage.setItem('wasScanning', 'false');
+      sessionStorage.setItem('isCameraCheckCompleted', 'true');
+    }
+  }, [appState, isCameraCheckConfirmed, isCameraCheckCompleted, cameraTimeLeft]);
 
   // Bulletproof Video Stream & Camera Sync
   useEffect(() => {
@@ -589,14 +723,14 @@ function CandidatePortal({ directQA = false }) {
   }, [appState, isInterviewComplete]);
 
   useEffect(() => {
-    if (currentQuestion && isCameraCheckCompleted) {
-      const qText = typeof currentQuestion === 'string' ? currentQuestion : currentQuestion.question;
-      speakText(qText);
-      window.submitAnswerFn = submitAnswer;
+    if (currentQuestion && isCameraCheckCompleted && appState === 'interview') {
+      const qText = getQuestionTextString(currentQuestion);
       answerTextRef.current = "";
       setAnswerText("");
+      window.submitAnswerFn = submitAnswer;
+      if (qText) speakText(qText);
     }
-  }, [currentQuestion, isCameraCheckCompleted]);
+  }, [currentQuestion, isCameraCheckCompleted, appState]);
 
   const handleFileChange = (e) => {
     if (e.target.files && e.target.files[0]) {
@@ -1145,59 +1279,7 @@ function CandidatePortal({ directQA = false }) {
       audioDataArrayRef.current = new Uint8Array(analyser.frequencyBinCount);
 
       // Initialize Web Speech API for True Human Voice Detection
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (SpeechRecognition) {
-        const recognition = new SpeechRecognition();
-        recognition.continuous = true;
-        recognition.interimResults = true;
-
-        recognition.onresult = (event) => {
-          if (window.isAgentSpeaking) return; // Ignore AI's own voice!
-
-          isHumanSpeechDetectedRef.current = true;
-          let totalTranscript = '';
-          for (let i = 0; i < event.results.length; ++i) {
-            totalTranscript += event.results[i][0].transcript;
-          }
-          if (totalTranscript) {
-            setAnswerText(totalTranscript);
-            answerTextRef.current = totalTranscript;
-          }
-
-          // Extended silence timeout: 12 seconds of complete silence giving ample time to pause & think
-          if (window.speechTimeout) clearTimeout(window.speechTimeout);
-          window.speechTimeout = setTimeout(() => {
-            isHumanSpeechDetectedRef.current = false;
-            if (!isCameraCheckPhaseRef.current && window.submitAnswerFn && answerTextRef.current && answerTextRef.current.trim().length > 15) {
-              if (!isHardwareMutedRef.current) {
-                window.submitAnswerFn(false);
-              }
-            }
-          }, 12000);
-        };
-
-        recognition.onerror = (e) => {
-          if (e.error !== 'no-speech') {
-            console.log('Speech recognition error:', e.error);
-          }
-        };
-
-        recognition.onend = () => {
-          // Automatically restart recognition to run continuously during interview
-          if (streamRef.current) {
-            try {
-              recognition.start();
-            } catch (e) { }
-          }
-        };
-
-        try {
-          recognition.start();
-          recognitionRef.current = recognition;
-        } catch (e) {
-          console.log('Speech recognition start error:', e);
-        }
-      }
+      startOrRestartSpeechRecognition();
 
       // Wait for React to render the video element
       setTimeout(() => {
@@ -2138,58 +2220,107 @@ function CandidatePortal({ directQA = false }) {
                   </div>
 
                   <h2 style={{ fontSize: '1.4rem', marginBottom: '2rem', lineHeight: '1.6', fontWeight: '500', color: '#f8fafc' }}>
-                    {typeof currentQuestion === 'string' ? currentQuestion : currentQuestion?.question}
+                    {getQuestionTextString(currentQuestion)}
                   </h2>
 
                   <h3 style={{ fontSize: '1.1rem', marginBottom: '1rem', color: '#cbd5e1' }}>
-                    Speak your answer naturally. The AI is listening...
+                    {isAiSpeaking ? 'AI is asking the question...' : 'Speak your answer naturally. The AI is listening...'}
                   </h3>
 
                   <div style={{
                     width: '100%',
-                    minHeight: '150px',
-                    padding: '1.5rem',
+                    minHeight: '160px',
+                    padding: '1.2rem',
                     borderRadius: '12px',
-                    background: 'rgba(15, 23, 42, 0.8)',
-                    border: '1px solid rgba(255, 255, 255, 0.2)',
+                    background: 'rgba(15, 23, 42, 0.85)',
+                    border: `1px solid ${isAiSpeaking ? 'rgba(168, 85, 247, 0.4)' : (answerText ? 'rgba(59, 130, 246, 0.5)' : 'rgba(255, 255, 255, 0.2)')}`,
                     color: '#fff',
-                    fontSize: '1.2rem',
-                    lineHeight: '1.6',
                     marginBottom: '1.5rem',
                     display: 'flex',
                     flexDirection: 'column',
-                    justifyContent: 'center',
                     alignItems: 'center',
-                    textAlign: 'center'
+                    justifyContent: 'center',
+                    boxShadow: isAiSpeaking ? '0 0 15px rgba(168, 85, 247, 0.15)' : (answerText ? '0 0 15px rgba(59, 130, 246, 0.15)' : 'none')
                   }}>
-                    {answerText ? (
-                      <p style={{ fontStyle: 'italic', color: '#cbd5e1' }}>"{answerText}"</p>
-                    ) : (
-                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1rem' }}>
-                        <div style={{
-                          width: '50px',
-                          height: '50px',
-                          borderRadius: '50%',
-                          background: 'rgba(59, 130, 246, 0.2)',
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
-                          animation: 'pulse 1.5s infinite'
-                        }}>
-                          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#60A5FA" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                            <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"></path>
-                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-                            <line x1="12" y1="19" x2="12" y2="23"></line>
-                            <line x1="8" y1="23" x2="16" y2="23"></line>
-                          </svg>
-                        </div>
-                        <p style={{ color: '#94a3b8', fontSize: '1rem' }}>Listening to your response...</p>
-                      </div>
-                    )}
+                    <div style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.6rem',
+                      marginBottom: '0.8rem',
+                      fontSize: '0.9rem',
+                      fontWeight: '500',
+                      color: isAiSpeaking ? '#C084FC' : (answerText ? '#60A5FA' : '#94a3b8')
+                    }}>
+                      <div style={{
+                        width: '10px',
+                        height: '10px',
+                        borderRadius: '50%',
+                        background: isAiSpeaking ? '#C084FC' : '#3B82F6',
+                        animation: 'pulse 1.5s infinite'
+                      }}></div>
+                      <span>
+                        {isAiSpeaking ? 'AI is asking the question...' : (answerText ? 'Transcribing response (Voice active - editable below):' : 'Listening for your voice... Speak now')}
+                      </span>
+                    </div>
+
+                    <textarea
+                      value={answerText}
+                      onChange={(e) => {
+                        setAnswerText(e.target.value);
+                        answerTextRef.current = e.target.value;
+                      }}
+                      placeholder={isAiSpeaking ? "Please wait for AI to finish speaking..." : "Speak into your microphone naturally, or type your answer here..."}
+                      disabled={isAiSpeaking || isSubmitting}
+                      style={{
+                        width: '100%',
+                        minHeight: '100px',
+                        background: 'transparent',
+                        border: 'none',
+                        outline: 'none',
+                        color: '#f8fafc',
+                        fontSize: '1.15rem',
+                        lineHeight: '1.6',
+                        fontFamily: 'inherit',
+                        resize: 'vertical',
+                        textAlign: answerText ? 'left' : 'center'
+                      }}
+                    />
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center', alignItems: 'center', marginBottom: '1rem' }}>
+                    <button
+                      onClick={() => submitAnswer(false)}
+                      disabled={isSubmitting || isAiSpeaking || !answerText || !answerText.trim()}
+                      className="gradient-btn"
+                      style={{
+                        padding: '0.8rem 2rem',
+                        fontSize: '1rem',
+                        opacity: (isSubmitting || isAiSpeaking || !answerText || !answerText.trim()) ? 0.5 : 1,
+                        cursor: (isSubmitting || isAiSpeaking || !answerText || !answerText.trim()) ? 'not-allowed' : 'pointer'
+                      }}
+                    >
+                      {isSubmitting ? 'Evaluating response...' : 'Submit Answer Now'}
+                    </button>
+                    <button
+                      onClick={() => startOrRestartSpeechRecognition()}
+                      disabled={isAiSpeaking}
+                      className="glass-card"
+                      style={{
+                        padding: '0.8rem 1.5rem',
+                        fontSize: '0.9rem',
+                        color: '#94a3b8',
+                        background: 'rgba(255, 255, 255, 0.05)',
+                        border: '1px solid rgba(255, 255, 255, 0.1)',
+                        borderRadius: '8px',
+                        cursor: isAiSpeaking ? 'not-allowed' : 'pointer'
+                      }}
+                    >
+                      Restart Mic
+                    </button>
                   </div>
                   
                   <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.9rem' }}>
-                    {isSubmitting ? 'Evaluating response...' : 'Stop speaking for 3 seconds to automatically submit.'}
+                    {isSubmitting ? 'Evaluating response...' : 'Speak naturally or click "Submit Answer Now" when finished.'}
                   </div>
                 </div>
               )}

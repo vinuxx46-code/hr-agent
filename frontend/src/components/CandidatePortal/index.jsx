@@ -146,6 +146,13 @@ function CandidatePortal({ directQA = false }) {
   const shouldListenRef = useRef(false);
   const isHumanSpeechDetectedRef = useRef(false);
   const backgroundVoiceCountRef = useRef(0);
+  // Speech recognition cannot identify who spoke. Accept a transcript only
+  // after a short-lived audiovisual confidence check that the visible candidate was speaking.
+  const lastMouthMotionAtRef = useRef(0);
+  const candidateSpeechVerifiedRef = useRef(false);
+  const unverifiedSpeechFramesRef = useRef(0);
+  const lastUnverifiedSpeechAlertRef = useRef(0);
+  const noiseFloorRef = useRef(0.008);
   const headTurnCountRef = useRef(0);
   const eyesWanderingCountRef = useRef(0);
   const majorPanFramesRef = useRef(0);
@@ -192,21 +199,41 @@ function CandidatePortal({ directQA = false }) {
         if (window.isAgentSpeaking && isAiSpeaking) return;
 
         isHumanSpeechDetectedRef.current = true;
+        const recentlyVerified = candidateSpeechVerifiedRef.current &&
+          performance.now() - lastMouthMotionAtRef.current < 900;
+
+        // Do not turn a nearby person's voice, a speaker, or an assistant into
+        // the candidate's answer. The incident remains available for HR audit.
+        if (!recentlyVerified) {
+          unverifiedSpeechFramesRef.current += 1;
+          if (unverifiedSpeechFramesRef.current >= 2 &&
+              performance.now() - lastUnverifiedSpeechAlertRef.current > 6000 &&
+              !isCameraCheckPhaseRef.current) {
+            recordProctoringEvent('UNVERIFIED_SPEECH_DETECTED');
+            lastUnverifiedSpeechAlertRef.current = performance.now();
+            unverifiedSpeechFramesRef.current = 0;
+          }
+          // Do not leave the VAD in a speaking state after rejected speech;
+          // rejected speech must never trigger the silence auto-submit path.
+          window.setTimeout(() => { isHumanSpeechDetectedRef.current = false; }, 1200);
+          return;
+        }
+
+        unverifiedSpeechFramesRef.current = 0;
         let finalTranscript = '';
         let interimTranscript = '';
-
-        for (let i = 0; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) {
-            finalTranscript += event.results[i][0].transcript + ' ';
-          } else {
-            interimTranscript += event.results[i][0].transcript;
-          }
+        // Process only the newly delivered recognition results. Re-reading all
+        // prior results duplicates text and makes transcript injection easier.
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          if (event.results[i].isFinal) finalTranscript += event.results[i][0].transcript + ' ';
+          else interimTranscript += event.results[i][0].transcript;
         }
 
         const fullText = (finalTranscript + interimTranscript).trim();
         if (fullText) {
-          setAnswerText(fullText);
-          answerTextRef.current = fullText;
+          const mergedText = `${answerTextRef.current ? `${answerTextRef.current} ` : ''}${fullText}`.trim();
+          setAnswerText(mergedText);
+          answerTextRef.current = mergedText;
         }
 
         // Extended silence timeout: 12 seconds of complete silence after candidate speaks
@@ -327,26 +354,8 @@ function CandidatePortal({ directQA = false }) {
     }
   };
 
-  // Global Bypass Key Listener (Ctrl+Shift+B)
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if (e.ctrlKey && e.shiftKey && (e.key === 'B' || e.key === 'b')) {
-        e.preventDefault();
-        setScanProgressPercent(100);
-        setHasAdditionalPersonDetected(false);
-        setIsScanPaused(false);
-        setIsWarningConfirmed(true);
-        setIsCameraCheckConfirmed(true);
-        setIsCameraCheckCompleted(true);
-        isCameraCheckPhaseRef.current = false;
-        sessionStorage.setItem('wasScanning', 'false');
-        sessionStorage.setItem('scanProgressPercent', '100');
-        sessionStorage.setItem('isCameraCheckCompleted', 'true');
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
+  // Camera verification deliberately has no keyboard bypass. A client-side
+  // shortcut is discoverable and invalidates the proctoring evidence.
 
   // Check for URL token on mount
   useEffect(() => {
@@ -891,6 +900,7 @@ function CandidatePortal({ directQA = false }) {
     else if (type === "TAB_SWITCH") warningMessage = "Warning. Do not switch tabs.";
     else if (type === "WINDOW_BLUR") warningMessage = "Warning. Keep the interview window in focus.";
     else if (type === "BACKGROUND_VOICE") warningMessage = "Warning. Unrecognized background voice detected. Please ensure you are alone and quiet.";
+    else if (type === "UNVERIFIED_SPEECH_DETECTED") warningMessage = "Security warning. Speech was detected without matching candidate mouth movement. Only your own spoken response may be recorded.";
     else if (type === "EXTRA_HANDS") warningMessage = "Warning. Another person's hand detected in the frame. You must take this interview alone.";
     else if (type === "EYES_WANDERING") warningMessage = "Warning. Please keep your eyes focused directly on the screen.";
     else if (type === "HEAD_TURNED") warningMessage = "Warning. Head movement detected. You must look straight at the camera.";
@@ -1035,36 +1045,31 @@ function CandidatePortal({ directQA = false }) {
         }
       }
 
-      // BACKGROUND VOICE DETECTION (LIP SYNC CORRELATION)
-      let isSpeakingAudio = false;
-
-      if (isHumanSpeechDetectedRef.current) {
-        isSpeakingAudio = true; // SpeechRecognition detected actual human words/voice
-      } else if (audioAnalyserRef.current && audioDataArrayRef.current) {
-        // Fallback strict acoustic check if SpeechRecognition is not supported
+      // Audio VAD + lip-sync correlation. SpeechRecognition alone is not a
+      // security signal: it transcribes any nearby voice or loudspeaker.
+      let isSpeakingAudio = isHumanSpeechDetectedRef.current;
+      if (audioAnalyserRef.current && audioDataArrayRef.current) {
+        const samples = new Uint8Array(audioAnalyserRef.current.fftSize);
+        audioAnalyserRef.current.getByteTimeDomainData(samples);
+        let energy = 0;
+        for (const sample of samples) {
+          const normalized = (sample - 128) / 128;
+          energy += normalized * normalized;
+        }
+        const rms = Math.sqrt(energy / samples.length);
+        // Adapt only while the room is quiet so a speaking voice cannot train
+        // itself into the ambient baseline.
+        if (rms < noiseFloorRef.current * 1.6) noiseFloorRef.current = noiseFloorRef.current * 0.96 + rms * 0.04;
         audioAnalyserRef.current.getByteFrequencyData(audioDataArrayRef.current);
-        let sum = 0;
-        let count = 0;
-        // Much narrower focus to avoid broadband noise (e.g. 500Hz-2000Hz only)
-        for (let i = 3; i < 15 && i < audioDataArrayRef.current.length; i++) {
-          sum += audioDataArrayRef.current[i];
-          count++;
-        }
-        let average = count > 0 ? sum / count : 0;
-        // Very high threshold so random noise doesn't trigger it, only loud sustained sounds
-        if (average > 60) isSpeakingAudio = true;
+        let voiceBand = 0;
+        for (let i = 3; i < 20 && i < audioDataArrayRef.current.length; i++) voiceBand += audioDataArrayRef.current[i];
+        voiceBand /= 17;
+        isSpeakingAudio = isSpeakingAudio || (rms > Math.max(noiseFloorRef.current * 2.6, 0.018) && voiceBand > 18);
 
-        // KEYBOARD TYPING DETECTION (High Frequency Spikes)
-        let highFreqSum = 0;
-        let highFreqCount = 0;
-        for (let i = 50; i < 150 && i < audioDataArrayRef.current.length; i++) {
-          highFreqSum += audioDataArrayRef.current[i];
-          highFreqCount++;
-        }
-        let highFreqAverage = highFreqCount > 0 ? highFreqSum / highFreqCount : 0;
-        if (highFreqAverage > 45 && !isSpeakingAudio && currentQuestionIndex >= 0) {
-          recordProctoringEvent("KEYBOARD_TYPING_DETECTED");
-        }
+        let highFreqAverage = 0;
+        for (let i = 50; i < 150 && i < audioDataArrayRef.current.length; i++) highFreqAverage += audioDataArrayRef.current[i];
+        highFreqAverage /= 100;
+        if (highFreqAverage > 45 && !isSpeakingAudio && currentQuestionIndex >= 0) recordProctoringEvent("KEYBOARD_TYPING_DETECTED");
       }
 
       let isMouthMoving = false;
@@ -1072,8 +1077,10 @@ function CandidatePortal({ directQA = false }) {
         const shapes = results.faceBlendshapes[0].categories;
         const jawOpen = shapes.find(c => c.categoryName === 'jawOpen');
         // Require more significant mouth movement to suppress background noise warning
-        if (jawOpen && jawOpen.score > 0.15) { 
+        if (jawOpen && jawOpen.score > 0.15) {
           isMouthMoving = true;
+          lastMouthMotionAtRef.current = performance.now();
+          candidateSpeechVerifiedRef.current = true;
         }
 
         // ENTERPRISE STRICT DUAL-MODE EYE TRACKING (Blendshapes + Iris Pupil Landmarks)
@@ -1134,7 +1141,9 @@ function CandidatePortal({ directQA = false }) {
         headTurnCountRef.current = Math.max(0, headTurnCountRef.current - 3);
       }
 
-      if (isSpeakingAudio && !isMouthMoving && !window.isAgentSpeaking) {
+      const hasRecentCandidateLipMotion = candidateSpeechVerifiedRef.current &&
+        now - lastMouthMotionAtRef.current < 650;
+      if (isSpeakingAudio && !hasRecentCandidateLipMotion && !window.isAgentSpeaking) {
         backgroundVoiceCountRef.current += 1;
       } else {
         backgroundVoiceCountRef.current = Math.max(0, backgroundVoiceCountRef.current - 2); // Decay quickly when noise stops
@@ -1605,6 +1614,7 @@ function CandidatePortal({ directQA = false }) {
           sessionId: currentSessionId,
           questionIndex: currentQuestionIndex,
           answer: submissionText,
+          // Includes UNVERIFIED_SPEECH_DETECTED events for the server-side HR audit.
           proctoringEvents: proctoringEvents.current
         })
       });

@@ -20,7 +20,9 @@ import io
 import asyncio
 import time
 
-load_dotenv()
+# Explicitly load .env from parent directory (project root)
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+load_dotenv(dotenv_path=_env_path, override=True)
 
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -231,13 +233,16 @@ async def process_single_resume(content: bytes, filename: str):
         prompt = build_strict_matching_prompt(company_expectations, resume_text)
         gemini_contents = [prompt]
         if not resume_text.strip() or is_image:
-            gemini_contents.append({
-                "mime_type": mime_type,
-                "data": content
-            })
+            from google.genai import types as genai_types
+            gemini_contents = [
+                genai_types.Content(parts=[
+                    genai_types.Part(text=prompt),
+                    genai_types.Part(inline_data=genai_types.Blob(mime_type=mime_type, data=content))
+                ])
+            ]
 
         api_key = os.environ.get("GEMINI_API_KEY", "")
-        if not api_key or api_key == "your_actual_api_key_here" or api_key == "fake-key-for-now" or not api_key.startswith("AIza"):
+        if not api_key or api_key == "your_actual_api_key_here" or api_key == "fake-key-for-now" or not (api_key.startswith("AIza") or api_key.startswith("AQ.")):
             raise ValueError("Invalid API Key, skipping to offline fallback for instant processing")
             
         response = await asyncio.wait_for(
@@ -363,13 +368,16 @@ async def upload_resume(resume: UploadFile = File(...)):
         
         # If text is empty (scanned PDF or image), pass the raw data for OCR
         if not resume_text.strip() or is_image:
-            gemini_contents.append({
-                "mime_type": mime_type,
-                "data": content
-            })
+            from google.genai import types as genai_types
+            gemini_contents = [
+                genai_types.Content(parts=[
+                    genai_types.Part(text=prompt),
+                    genai_types.Part(inline_data=genai_types.Blob(mime_type=mime_type, data=content))
+                ])
+            ]
 
         api_key = os.environ.get("GEMINI_API_KEY", "")
-        if not api_key or api_key == "your_actual_api_key_here" or api_key == "fake-key-for-now" or not api_key.startswith("AIza"):
+        if not api_key or api_key == "your_actual_api_key_here" or api_key == "fake-key-for-now" or not (api_key.startswith("AIza") or api_key.startswith("AQ.")):
             raise ValueError("Invalid API Key, skipping to offline fallback for instant processing")
             
         response = await asyncio.wait_for(
@@ -477,13 +485,16 @@ async def analyze_candidate(resume: UploadFile = File(...), jobDescription: str 
         
         # If text is empty (scanned PDF or image), pass the raw data for OCR
         if not resume_text.strip() or is_image:
-            gemini_contents.append({
-                "mime_type": mime_type,
-                "data": content
-            })
+            from google.genai import types as genai_types
+            gemini_contents = [
+                genai_types.Content(parts=[
+                    genai_types.Part(text=prompt),
+                    genai_types.Part(inline_data=genai_types.Blob(mime_type=mime_type, data=content))
+                ])
+            ]
 
         api_key = os.environ.get("GEMINI_API_KEY", "")
-        if not api_key or api_key == "your_actual_api_key_here" or api_key == "fake-key-for-now" or not api_key.startswith("AIza"):
+        if not api_key or api_key == "your_actual_api_key_here" or api_key == "fake-key-for-now" or not (api_key.startswith("AIza") or api_key.startswith("AQ.")):
             raise ValueError("Invalid API Key, skipping to offline fallback for instant processing")
             
         response = await asyncio.wait_for(
@@ -551,7 +562,7 @@ class InterviewStartRequest(BaseModel):
     resumeContext: dict
     candidateName: str = "Candidate"
     jobRole: str = "Software Engineer"
-    token: str = None
+    token: Optional[str] = None  # Fixed: Pydantic v2 requires Optional for nullable str
 
 class InterviewAnswerRequest(BaseModel):
     sessionId: str
@@ -1195,7 +1206,7 @@ def generate_candidate_pdf_report(candidate: dict) -> str:
             self.cell(0, 8, 'CANDIDATE INTERVIEW & PROCTORING AUDIT REPORT', align='C', new_x='LMARGIN', new_y='NEXT')
             self.set_font('Helvetica', '', 8)
             self.set_text_color(148, 163, 184)
-            self.cell(0, 5, 'AI Agent Recruiter - Executive Screening & Proctoring Log', align='C', new_x='LMARGIN', new_y='NEXT')
+            self.cell(0, 5, 'Recruiter - Executive Screening & Proctoring Log', align='C', new_x='LMARGIN', new_y='NEXT')
             self.ln(6)
 
         def footer(self):
@@ -1395,7 +1406,7 @@ FINAL AI EVALUATION & MATCH SCORE
 - Score: {score} / {total_marks} ({percentage}%)
 - Recommendation: {rec}
 ==================================================
-This report was automatically generated by AI Agent Recruiter."""
+This report was automatically generated by Recruiter."""
 
     timeline_items = ""
     if has_violations and isinstance(proctoring, list):
@@ -1473,7 +1484,7 @@ This report was automatically generated by AI Agent Recruiter."""
       </div>
     </div>
     <div style="text-align: center; padding: 20px; border-top: 1px solid rgba(255,255,255,0.05); color: #64748b; font-size: 12px;">
-      This report was automatically generated by AI Agent Recruiter. Attached: Official PDF Audit Report.
+      This report was automatically generated by Recruiter. Attached: Official PDF Audit Report.
     </div>
   </div>
 </body>

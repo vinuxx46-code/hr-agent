@@ -1,8 +1,21 @@
 import React, { useState, useEffect } from 'react';
 import './index.css';
 
+// The HR key is supplied by the operator at runtime and kept in sessionStorage
+// so it is never baked into the bundle or committed to the repository.
+const HR_KEY_STORAGE = 'hrApiKey';
+
+const getHrKey = () => sessionStorage.getItem(HR_KEY_STORAGE) || '';
+
+const hrHeaders = (extra = {}) => {
+  const key = getHrKey();
+  return key ? { ...extra, 'X-HR-Key': key } : extra;
+};
+
 function HrDashboard() {
   const [candidates, setCandidates] = useState([]);
+  const [hrKey, setHrKey] = useState(getHrKey());
+  const [authError, setAuthError] = useState('');
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCandidate, setSelectedCandidate] = useState(null);
@@ -14,12 +27,19 @@ function HrDashboard() {
     try {
       setEmailSending(true);
       setEmailStatus('');
-      const res = await fetch(`http://localhost:8000/api/hr/send-email/${token}`, {
-        method: 'POST'
+      // Relative URL so the dev-server proxy handles hosted previews; a
+      // hardcoded localhost address is unreachable from a remote browser.
+      const res = await fetch(`/api/hr/send-email/${token}`, {
+        method: 'POST',
+        headers: hrHeaders()
       });
+      if (res.status === 401 || res.status === 503) {
+        setEmailStatus('⚠️ HR authentication required. Enter your HR key above.');
+        return;
+      }
       const data = await res.json();
       if (res.ok && data.success) {
-        setEmailStatus('✓ Report PDF successfully emailed to HR (vinuxx46@gmail.com)!');
+        setEmailStatus(`✓ Report PDF emailed to HR${data.message ? ` (${data.message})` : ''}!`);
       } else {
         setEmailStatus(`⚠️ ${data.error || 'Failed to send email'}`);
       }
@@ -30,15 +50,40 @@ function HrDashboard() {
     }
   };
 
-  const downloadPdf = (token) => {
-    window.open(`http://localhost:8000/api/hr/download-pdf/${token}`, '_blank');
+  const downloadPdf = async (token) => {
+    // window.open cannot carry the auth header, so fetch the PDF and hand the
+    // browser a blob URL instead.
+    try {
+      const res = await fetch(`/api/hr/download-pdf/${token}`, { headers: hrHeaders() });
+      if (!res.ok) {
+        setEmailStatus('⚠️ Unable to download report (check your HR key).');
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      window.open(url, '_blank');
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch (err) {
+      setEmailStatus('⚠️ Network error downloading report.');
+    }
   };
 
   const fetchCandidates = async () => {
     try {
       setLoading(true);
-      const res = await fetch('http://localhost:8000/api/hr/candidates');
+      const res = await fetch('/api/hr/candidates', { headers: hrHeaders() });
+      if (res.status === 401) {
+        setAuthError('Invalid or missing HR key. Enter a valid key to view candidates.');
+        setCandidates([]);
+        return;
+      }
+      if (res.status === 503) {
+        setAuthError('HR API is not configured on the server. Set HR_API_KEY and restart the backend.');
+        setCandidates([]);
+        return;
+      }
       if (res.ok) {
+        setAuthError('');
         const data = await res.json();
         setCandidates(data.candidates || []);
       }
@@ -47,6 +92,11 @@ function HrDashboard() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const saveHrKey = (value) => {
+    sessionStorage.setItem(HR_KEY_STORAGE, value);
+    setHrKey(value);
   };
 
   useEffect(() => {
@@ -73,6 +123,41 @@ function HrDashboard() {
         </h1>
         <p style={{ color: 'var(--text-muted)' }}>Automated AI Screening, 360° Proctoring Audits, & Session Screen Recordings</p>
       </header>
+
+      {/* HR authentication */}
+      <div style={{
+        display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap',
+        marginBottom: '1.25rem', padding: '0.9rem 1.1rem', borderRadius: '12px',
+        background: 'rgba(15, 23, 42, 0.6)', border: '1px solid rgba(255,255,255,0.12)'
+      }}>
+        <span style={{ color: '#94a3b8', fontSize: '0.9rem', whiteSpace: 'nowrap' }}>
+          🔐 HR access key
+        </span>
+        <input
+          type="password"
+          placeholder="Enter HR API key to load candidate data"
+          value={hrKey}
+          onChange={(e) => saveHrKey(e.target.value)}
+          style={{
+            flex: 1, minWidth: '240px', padding: '0.6rem 0.9rem', borderRadius: '8px',
+            background: 'rgba(2, 6, 23, 0.85)', border: '1px solid rgba(255,255,255,0.15)',
+            color: '#fff', fontSize: '0.9rem'
+          }}
+        />
+        <button className="btn-secondary" onClick={fetchCandidates} style={{ borderRadius: '8px' }}>
+          Unlock
+        </button>
+      </div>
+
+      {authError && (
+        <div style={{
+          marginBottom: '1.25rem', padding: '0.85rem 1.1rem', borderRadius: '10px',
+          background: 'rgba(127, 29, 29, 0.35)', border: '1px solid rgba(248,113,113,0.45)',
+          color: '#fecaca', fontSize: '0.9rem'
+        }}>
+          ⚠️ {authError}
+        </div>
+      )}
 
       {/* Control Bar */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem', gap: '1rem', flexWrap: 'wrap' }}>
@@ -357,7 +442,7 @@ function HrDashboard() {
                   🎥 Session Video Recording & Screen Capture
                 </h3>
                 <a
-                  href={`http://localhost:8000/recordings/${selectedCandidate.token}.webm`}
+                  href={`/recordings/${selectedCandidate.token}.webm`}
                   target="_blank"
                   download={`Interview_Recording_${selectedCandidate.token}.webm`}
                   rel="noreferrer"
@@ -373,7 +458,7 @@ function HrDashboard() {
                     preload="metadata"
                     style={{ width: '100%', maxHeight: '400px', display: 'block' }}
                     onError={() => setVideoError(true)}
-                    src={`http://localhost:8000/recordings/${selectedCandidate.token}.webm`}>
+                    src={`/recordings/${selectedCandidate.token}.webm`}>
                     Your browser does not support HTML5 video streaming.
                   </video>
                 </div>
@@ -383,7 +468,7 @@ function HrDashboard() {
                     📹 Video Recording stream location:
                     <br />
                     <code style={{ fontSize: '0.82rem', color: '#a5b4fc', wordBreak: 'break-all' }}>
-                      http://localhost:8000/recordings/{selectedCandidate.token}.webm
+                      /recordings/{selectedCandidate.token}.webm
                     </code>
                   </p>
                   <p style={{ color: 'rgba(255,255,255,0.4)', fontSize: '0.8rem', marginTop: '0.5rem' }}>

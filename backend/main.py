@@ -1172,27 +1172,47 @@ async def validate_token(token: str):
 
 @app.post("/api/verify-360-scan/{token}")
 async def verify_360_scan(token: str, request: Request):
-    db = load_hr_db()
-    if token in db["candidates"]:
-        db["candidates"][token]["scan_360_verified"] = True
-        db["candidates"][token]["scan_360_verified_at"] = datetime.now().isoformat()
-        
-        try:
-            body = await request.json()
-            events = body.get("proctoringEvents", [])
-            if events and isinstance(events, list):
-                if "proctoring_logs" not in db["candidates"][token] or not isinstance(db["candidates"][token]["proctoring_logs"], list):
-                    db["candidates"][token]["proctoring_logs"] = []
-                existing_stamps = [e.get("timestamp") for e in db["candidates"][token]["proctoring_logs"] if isinstance(e, dict)]
-                for ev in events:
-                    if isinstance(ev, dict) and ev.get("timestamp") not in existing_stamps:
-                        db["candidates"][token]["proctoring_logs"].append(ev)
-        except Exception as e:
-            print(f"Error parsing 360 scan body: {e}")
+    """Record a completed room scan only when the active session supplies the
+    minimum telemetry required by the candidate workflow.
 
-        save_hr_db(db)
-        return {"success": True, "message": "360-degree room verification validated on server."}
-    return {"success": False, "error": "Token not found"}
+    Browser telemetry is audit evidence, not biometric identity proof; final
+    review remains with HR.
+    """
+    db = load_hr_db()
+    candidate = db.get("candidates", {}).get(token)
+    if not candidate:
+        return {"success": False, "error": "Token not found"}
+    if candidate.get("status") != "IN_PROGRESS":
+        return {"success": False, "error": "Interview is not active"}
+
+    try:
+        body = await request.json()
+    except Exception:
+        return {"success": False, "error": "Invalid verification payload"}
+
+    coverage = body.get("coveragePercent", 0)
+    distinct_views = body.get("distinctViews", 0)
+    additional_person = body.get("additionalPersonDetected", True)
+    events = body.get("proctoringEvents", [])
+    if not isinstance(coverage, (int, float)) or coverage < 80 or not isinstance(distinct_views, int) or distinct_views < 8:
+        return {"success": False, "error": "Incomplete room scan. At least 80% coverage and 8 distinct views are required."}
+    if additional_person:
+        return {"success": False, "error": "Additional person or device was detected during the room scan."}
+    if not isinstance(events, list):
+        return {"success": False, "error": "Invalid proctoring events"}
+
+    candidate["scan_360_verified"] = True
+    candidate["scan_360_verified_at"] = datetime.now().isoformat()
+    candidate["scan_360_telemetry"] = {"coveragePercent": coverage, "distinctViews": distinct_views}
+    logs = candidate.setdefault("proctoring_logs", [])
+    if not isinstance(logs, list):
+        logs = candidate["proctoring_logs"] = []
+    existing_stamps = {e.get("timestamp") for e in logs if isinstance(e, dict)}
+    for event in events:
+        if isinstance(event, dict) and event.get("timestamp") not in existing_stamps:
+            logs.append(event)
+    save_hr_db(db)
+    return {"success": True, "message": "360-degree room verification recorded."}
 
 @app.post("/api/log-proctoring-event/{token}")
 async def log_proctoring_event(token: str, event: dict = Body(...)):

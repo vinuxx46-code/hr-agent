@@ -84,6 +84,7 @@ function CandidatePortal({ directQA = false }) {
     return saved ? parseInt(saved) : 0;
   });
   const seenKeyframesRef = useRef([]);
+  const scanCoverageRef = useRef(0);
   const [is360ServerVerified, setIs360ServerVerified] = useState(false);
   const hasAdditionalPersonRef = useRef(false);
   const [hasAdditionalPersonDetected, setHasAdditionalPersonDetected] = useState(false);
@@ -138,6 +139,9 @@ function CandidatePortal({ directQA = false }) {
   const lastVideoTimeRef = useRef(-1);
   const lastInferenceTimeRef = useRef(0);
   const lastWarningTimeRef = useRef(0);
+  // Different signals need independent cooldowns. A face alert must never
+  // suppress a sustained off-screen gaze or a possible second speaker.
+  const eventCooldownsRef = useRef({});
 
   // Audio analysis refs
   const audioContextRef = useRef(null);
@@ -603,25 +607,15 @@ function CandidatePortal({ directQA = false }) {
 
         setCameraTimeLeft((prev) => {
           if (prev <= 1) {
-            if (scanInterval) clearInterval(scanInterval);
-            setIsCameraCheckCompleted(true);
-            isCameraCheckPhaseRef.current = false;
-            setIsScanPaused(false);
-            sessionStorage.setItem('wasScanning', 'false');
-            sessionStorage.setItem('isCameraCheckCompleted', 'true');
-
-            // Validate 360-degree verification result and send proctoring events to backend server
-            const activeToken = inviteToken || new URLSearchParams(window.location.search).get('token');
-            if (activeToken) {
-              fetch(`${apiUrl(`/api/verify-360-scan/${activeToken}`)}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ proctoringEvents: proctoringEvents.current })
-              })
-                .then(() => setIs360ServerVerified(true))
-                .catch(() => {});
+            // Time passing alone is not evidence of a room scan. Require enough
+            // distinct views and no additional person/device before unlocking.
+            if (seenKeyframesRef.current.length >= 8 && !hasAdditionalPersonRef.current) {
+              if (scanInterval) clearInterval(scanInterval);
+              void finalizeRoomVerification();
+              return 0;
             }
-
+            setIsScanPaused(true);
+            recordProctoringEvent('ROOM_SCAN_INCOMPLETE');
             return 0;
           }
           return Math.max(0, prev - 1);
@@ -633,17 +627,6 @@ function CandidatePortal({ directQA = false }) {
       if (scanInterval) clearInterval(scanInterval);
     };
   }, [appState, isCameraCheckConfirmed, isCameraCheckCompleted, customWarning.show, inviteToken]);
-
-  // Safety Fallback Guard: If scan timer reaches 0, ensure transition to interview phase immediately
-  useEffect(() => {
-    if (appState === 'interview' && isCameraCheckConfirmed && !isCameraCheckCompleted && cameraTimeLeft <= 0) {
-      setIsCameraCheckCompleted(true);
-      isCameraCheckPhaseRef.current = false;
-      setIsScanPaused(false);
-      sessionStorage.setItem('wasScanning', 'false');
-      sessionStorage.setItem('isCameraCheckCompleted', 'true');
-    }
-  }, [appState, isCameraCheckConfirmed, isCameraCheckCompleted, cameraTimeLeft]);
 
   // Bulletproof Video Stream & Camera Sync
   useEffect(() => {
@@ -900,7 +883,7 @@ function CandidatePortal({ directQA = false }) {
     else if (type === "FACE_OUT_OF_FRAME") warningMessage = "Warning. Please look at the screen.";
     else if (type === "TAB_SWITCH") warningMessage = "Warning. Do not switch tabs.";
     else if (type === "WINDOW_BLUR") warningMessage = "Warning. Keep the interview window in focus.";
-    else if (type === "BACKGROUND_VOICE") warningMessage = "Warning. Unrecognized background voice detected. Please ensure you are alone and quiet.";
+    else if (type === "BACKGROUND_VOICE" || type === "POSSIBLE_SECOND_SPEAKER") warningMessage = "Security warning. Speech was detected without matching candidate lip movement. Remain alone and do not use external assistance.";
     else if (type === "UNVERIFIED_SPEECH_DETECTED") warningMessage = "Security warning. Speech was detected without matching candidate mouth movement. Only your own spoken response may be recorded.";
     else if (type === "EXTRA_HANDS") warningMessage = "Warning. Another person's hand detected in the frame. You must take this interview alone.";
     else if (type === "EYES_WANDERING") warningMessage = "Warning. Please keep your eyes focused directly on the screen.";
@@ -913,6 +896,48 @@ function CandidatePortal({ directQA = false }) {
     // Visual warning
     setIsWarningBlinking(true);
     setTimeout(() => setIsWarningBlinking(false), 1500);
+  };
+
+  const canRaiseSecurityAlert = (type, cooldownMs = 8000) => {
+    const now = performance.now();
+    const previous = eventCooldownsRef.current[type] || 0;
+    if (now - previous < cooldownMs) return false;
+    eventCooldownsRef.current[type] = now;
+    return true;
+  };
+
+  const finalizeRoomVerification = async () => {
+    // Never let local/session storage unlock an interview. The server must
+    // acknowledge the verification event before questions are made available.
+    const activeToken = inviteToken || new URLSearchParams(window.location.search).get('token');
+    if (!activeToken) {
+      setCustomWarning({ show: true, message: 'A valid interview invitation is required to complete room verification.' });
+      return false;
+    }
+    try {
+      const response = await fetch(apiUrl(`/api/verify-360-scan/${activeToken}`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          proctoringEvents: proctoringEvents.current,
+          coveragePercent: scanCoverageRef.current,
+          distinctViews: seenKeyframesRef.current.length,
+          additionalPersonDetected: hasAdditionalPersonRef.current
+        })
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Verification was not accepted');
+      setIs360ServerVerified(true);
+      setIsCameraCheckCompleted(true);
+      isCameraCheckPhaseRef.current = false;
+      setIsScanPaused(false);
+      sessionStorage.setItem('wasScanning', 'false');
+      sessionStorage.setItem('isCameraCheckCompleted', 'true');
+      return true;
+    } catch (error) {
+      setCustomWarning({ show: true, message: 'Room verification could not be saved. Check your connection and try again.' });
+      return false;
+    }
   };
 
   const predictWebcam = () => {
@@ -1088,7 +1113,7 @@ function CandidatePortal({ directQA = false }) {
         const eyeKeys = ['eyeLookInLeft', 'eyeLookOutLeft', 'eyeLookUpLeft', 'eyeLookDownLeft', 'eyeLookInRight', 'eyeLookOutRight', 'eyeLookUpRight', 'eyeLookDownRight'];
         let isEyesWandering = eyeKeys.some(key => {
           const shape = shapes.find(c => c.categoryName === key);
-          return shape && shape.score > 0.75; // Calibrated 0.75 gaze threshold (prevents false alerts while reading on-screen text)
+          return shape && shape.score > 0.68; // Alert only after sustained deviation below.
         });
 
         // Iris Pupil Landmark Position Tracking (Gaze Vector)
@@ -1103,7 +1128,7 @@ function CandidatePortal({ directQA = false }) {
               if (eyeWidth > 0) {
                 const pupilRatio = Math.abs(leftPupil.x - leftCornerInner.x) / eyeWidth;
                 // Pupil deviation outside true off-screen bounds (< 0.05 or > 0.95)
-                if (pupilRatio < 0.05 || pupilRatio > 0.95) {
+                if (pupilRatio < 0.12 || pupilRatio > 0.88) {
                   isEyesWandering = true;
                 }
               }
@@ -1127,12 +1152,12 @@ function CandidatePortal({ directQA = false }) {
         const rightEar = results.faceLandmarks[0][454];
 
         if (nose && leftEar && rightEar) {
-          const distLeft = Math.abs(nose.x - leftEar.x);
-          const distRight = Math.abs(nose.x - rightEar.x);
-          // Head turn ratio (detects turning head completely away from monitor > 2.2)
-          if (distLeft / distRight > 2.2 || distRight / distLeft > 2.2) {
-            isHeadTurned = true;
-          }
+          const faceWidth = Math.abs(rightEar.x - leftEar.x);
+          const faceCenter = (leftEar.x + rightEar.x) / 2;
+          // Normalise the nose displacement against face width. This is less
+          // sensitive to webcam position than a raw left/right distance ratio.
+          const yawOffset = faceWidth > 0 ? Math.abs(nose.x - faceCenter) / faceWidth : 0;
+          if (yawOffset > 0.24) isHeadTurned = true;
         }
       }
 
@@ -1150,31 +1175,31 @@ function CandidatePortal({ directQA = false }) {
         backgroundVoiceCountRef.current = Math.max(0, backgroundVoiceCountRef.current - 2); // Decay quickly when noise stops
       }
 
-      // Require sustained noise (approx 1-1.5 seconds) to trigger, instead of a few frames
-      if (backgroundVoiceCountRef.current > 20 && now - lastWarningTimeRef.current > 6000) {
+      // A sustained audio stream without the candidate's visible lip movement
+      // is a possible second speaker or external audio source. It is an audit
+      // signal, not a voice-identity decision.
+      if (backgroundVoiceCountRef.current > 18 && canRaiseSecurityAlert('POSSIBLE_SECOND_SPEAKER')) {
         if (isCameraCheckPhaseRef.current) {
-          isPreCheckFailedRef.current = "Environment scan failed: Background voices detected. You must be in a quiet environment.";
+          isPreCheckFailedRef.current = "Environment scan failed: speech was detected without a visible speaker.";
         } else {
           setWarningsCount(prev => prev + 1);
-          recordProctoringEvent("BACKGROUND_VOICE");
-          lastWarningTimeRef.current = now;
-          backgroundVoiceCountRef.current = 0;
+          recordProctoringEvent("POSSIBLE_SECOND_SPEAKER");
         }
+        backgroundVoiceCountRef.current = 0;
       }
 
-      // Flag wandering eyes (Sustained off-screen gaze deviation > 45 frames, 5s cooldown)
-      if (eyesWanderingCountRef.current > 45 && now - lastWarningTimeRef.current > 5000) {
+      // At roughly 6–7 checks/second, 28 samples means ~4 seconds of sustained
+      // off-screen gaze/head rotation. Independent cooldowns prevent a face or
+      // audio event from hiding these warnings.
+      if (eyesWanderingCountRef.current >= 28 && canRaiseSecurityAlert('EYES_WANDERING')) {
         setWarningsCount(prev => prev + 1);
         recordProctoringEvent("EYES_WANDERING");
-        lastWarningTimeRef.current = now;
         eyesWanderingCountRef.current = 0;
       }
 
-      // Flag head turn (Sustained off-screen head turn > 45 frames, 5s cooldown)
-      if (headTurnCountRef.current > 45 && now - lastWarningTimeRef.current > 5000) {
+      if (headTurnCountRef.current >= 28 && canRaiseSecurityAlert('HEAD_TURNED')) {
         setWarningsCount(prev => prev + 1);
         recordProctoringEvent("HEAD_TURNED");
-        lastWarningTimeRef.current = now;
         headTurnCountRef.current = 0;
       }
     }
@@ -1390,6 +1415,7 @@ function CandidatePortal({ directQA = false }) {
       if ((seenKeyframesRef.current.length === 0 || minDistanceToKnownKeyframe >= 14.0) && seenKeyframesRef.current.length < 10) {
         seenKeyframesRef.current.push(new Uint8ClampedArray(imageData));
         const newPct = Math.min(100, Math.round((seenKeyframesRef.current.length / 10) * 100));
+        scanCoverageRef.current = newPct;
         setScanProgressPercent(newPct);
         sessionStorage.setItem('scanProgressPercent', newPct);
       }
@@ -1413,11 +1439,8 @@ function CandidatePortal({ directQA = false }) {
     setCameraTimeLeft(15);
     setIsScanPaused(true);
 
-    // Immediately mark token as USED / EXPIRED on backend (Single-Use Token Enforcement)
-    const activeToken = inviteToken || new URLSearchParams(window.location.search).get('token');
-    if (activeToken) {
-      fetch(`${apiUrl(`/api/expire-token/${activeToken}`)}`, { method: 'POST' }).catch(() => {});
-    }
+    // Token access is marked IN_PROGRESS during validation. Do not expire it
+    // here: the active candidate still needs to complete the interview.
 
     sessionStorage.setItem('wasScanning', 'true');
     referenceFrameRef.current = null;
@@ -1429,6 +1452,7 @@ function CandidatePortal({ directQA = false }) {
     seenKeyframesRef.current = [];
     hasAdditionalPersonRef.current = false;
     setHasAdditionalPersonDetected(false);
+    scanCoverageRef.current = 0;
     setScanProgressPercent(0);
     sessionStorage.setItem('scanProgressPercent', '0');
     
@@ -2125,57 +2149,11 @@ function CandidatePortal({ directQA = false }) {
                   : `Please continue rotating your camera slowly to scan the remaining room area (Coverage: ${scanProgressPercent}% / 80% required).`}
               </p>
 
-              {/* Bypass Option Button */}
-              <div style={{ marginTop: '1.2rem' }}>
-                <button 
-                  onClick={() => {
-                    setScanProgressPercent(100);
-                    setHasAdditionalPersonDetected(false);
-                    setIsScanPaused(false);
-                    setIsWarningConfirmed(true);
-                    setIsCameraCheckConfirmed(true);
-                    setIsCameraCheckCompleted(true);
-                    isCameraCheckPhaseRef.current = false;
-                    sessionStorage.setItem('wasScanning', 'false');
-                    sessionStorage.setItem('scanProgressPercent', '100');
-                    sessionStorage.setItem('isCameraCheckCompleted', 'true');
-                  }}
-                  style={{
-                    padding: '0.65rem 1.4rem',
-                    fontSize: '0.9rem',
-                    background: 'rgba(234, 179, 8, 0.2)',
-                    color: '#facc15',
-                    border: '1px solid rgba(234, 179, 8, 0.5)',
-                    borderRadius: '8px',
-                    cursor: 'pointer',
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '0.4rem',
-                    fontWeight: '600'
-                  }}>
-                  ⚡ Bypass Room Scan & Proctoring (Admin Override / Ctrl+Shift+B)
-                </button>
-              </div>
-
               {/* Unlock Button rendered ONLY when room verification is genuinely complete (>= 80% coverage) */}
               {(scanProgressPercent >= 80 && !hasAdditionalPersonDetected) && (
                 <button 
                   className="btn-primary" 
-                  onClick={() => {
-                    const activeToken = inviteToken || new URLSearchParams(window.location.search).get('token');
-                    if (activeToken) {
-                      fetch(`${apiUrl(`/api/verify-360-scan/${activeToken}`)}`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ proctoringEvents: proctoringEvents.current })
-                      }).catch(() => {});
-                    }
-                    setIsCameraCheckCompleted(true);
-                    isCameraCheckPhaseRef.current = false;
-                    setIsScanPaused(false);
-                    sessionStorage.setItem('wasScanning', 'false');
-                    sessionStorage.setItem('isCameraCheckCompleted', 'true');
-                  }}
+                  onClick={() => { void finalizeRoomVerification(); }}
                   style={{ marginTop: '1.5rem', padding: '0.8rem 2rem', fontSize: '1.1rem', background: '#22c55e', border: 'none', cursor: 'pointer' }}>
                   Continue to Next Interview Level ➔
                 </button>

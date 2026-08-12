@@ -81,6 +81,15 @@ function CandidatePortal() {
   const cameraTimerRef = useRef(null);
   const isHardwareMutedRef = useRef(false);
 
+  // Append-only voice transcript state. The Web Speech API resets
+  // `event.results` on every restart, so the raw results must be merged into a
+  // persistent buffer or earlier speech is silently overwritten.
+  const committedTranscriptRef = useRef("");
+  const sessionFinalRef = useRef("");
+  const silenceTimerRef = useRef(null);
+  const SILENCE_SUBMIT_MS = 5000;
+  const MIN_AUTO_SUBMIT_CHARS = 10;
+
   // Text to Speech Function
   const speakText = (text) => {
     if ('speechSynthesis' in window) {
@@ -247,6 +256,12 @@ function CandidatePortal() {
       const qText = typeof currentQuestion === 'string' ? currentQuestion : currentQuestion.question;
       speakText(qText);
       window.submitAnswerFn = submitAnswer;
+      committedTranscriptRef.current = "";
+      sessionFinalRef.current = "";
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+      }
       answerTextRef.current = "";
       setAnswerText("");
     }
@@ -762,25 +777,48 @@ function CandidatePortal() {
         recognition.interimResults = true;
 
         recognition.onresult = (event) => {
+          // Ignore our own TTS to prevent the agent transcribing itself.
+          if (window.isAgentSpeaking) return;
+
           isHumanSpeechDetectedRef.current = true;
-          let totalTranscript = '';
+          let sessionFinal = '';
+          let interim = '';
           for (let i = 0; i < event.results.length; ++i) {
-            totalTranscript += event.results[i][0].transcript;
+            const result = event.results[i];
+            if (!result || !result[0]) continue;
+            if (result.isFinal) {
+              sessionFinal += result[0].transcript + ' ';
+            } else {
+              interim += result[0].transcript;
+            }
           }
-          if (totalTranscript) {
-            setAnswerText(totalTranscript);
-            answerTextRef.current = totalTranscript;
+          sessionFinalRef.current = sessionFinal.trim();
+
+          const fullText = `${committedTranscriptRef.current} ${sessionFinal} ${interim}`
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (fullText) {
+            setAnswerText(fullText);
+            answerTextRef.current = fullText;
           }
 
-          if (window.speechTimeout) clearTimeout(window.speechTimeout);
-          window.speechTimeout = setTimeout(() => {
+          // Submit only after 5 seconds of true silence. The old 3s window cut
+          // candidates off mid-thought while they were still answering.
+          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+          silenceTimerRef.current = setTimeout(() => {
+            silenceTimerRef.current = null;
             isHumanSpeechDetectedRef.current = false;
-            if (!isCameraCheckPhaseRef.current && window.submitAnswerFn && answerTextRef.current && answerTextRef.current.trim().length > 0) {
-              if (!isHardwareMutedRef.current) {
-                window.submitAnswerFn(false);
-              }
+            const pending = (answerTextRef.current || '').trim();
+            if (
+              !isCameraCheckPhaseRef.current &&
+              window.submitAnswerFn &&
+              pending.length >= MIN_AUTO_SUBMIT_CHARS &&
+              !isHardwareMutedRef.current &&
+              !window.isAgentSpeaking
+            ) {
+              window.submitAnswerFn(false);
             }
-          }, 3000);
+          }, SILENCE_SUBMIT_MS);
         };
 
         recognition.onerror = (e) => {
@@ -790,6 +828,17 @@ function CandidatePortal() {
         };
 
         recognition.onend = () => {
+          // Preserve this session's speech before results are reset by restart.
+          const merged = `${committedTranscriptRef.current} ${sessionFinalRef.current}`
+            .replace(/\s+/g, ' ')
+            .trim();
+          committedTranscriptRef.current = merged;
+          sessionFinalRef.current = "";
+          if (merged) {
+            setAnswerText(merged);
+            answerTextRef.current = merged;
+          }
+
           // Automatically restart recognition to run continuously during interview
           if (streamRef.current) {
             try {
@@ -1026,9 +1075,22 @@ function CandidatePortal() {
     }
     setIsSubmitting(true);
     if (timerRef.current) clearInterval(timerRef.current);
-    
-    // Clear speech timeout to prevent double submission
-    if (window.speechTimeout) clearTimeout(window.speechTimeout);
+
+    // Cancel the pending silence auto-submit so it cannot fire twice.
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+
+    // Fold in speech still held by the live recognition instance.
+    const mergedOnSubmit = `${committedTranscriptRef.current} ${sessionFinalRef.current}`
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (mergedOnSubmit.length > (answerTextRef.current || '').trim().length) {
+      answerTextRef.current = mergedOnSubmit;
+    }
+    committedTranscriptRef.current = "";
+    sessionFinalRef.current = "";
 
     let submissionText = answerTextRef.current;
     if (isTimeout && !submissionText.trim()) {

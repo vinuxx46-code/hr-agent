@@ -161,9 +161,66 @@ function CandidatePortal({ directQA = false }) {
   const ttsSafetyTimeoutRef = useRef(null);
   const isSubmittingRef = useRef(false);
 
+  // ---------------------------------------------------------------------------
+  // VOICE-TO-VOICE TRANSCRIPT STATE (append-only preservation)
+  //
+  // The Web Speech API resets `event.results` every time a SpeechRecognition
+  // instance restarts. Recognition restarts constantly during an interview:
+  // after each `onend`, after network errors, and every time the AI speaks
+  // (we stop the mic to avoid echo). Rebuilding the answer purely from
+  // `event.results` therefore WIPES everything the candidate said before the
+  // most recent restart.
+  //
+  // Fix: keep an append-only `committedTranscriptRef` holding all speech
+  // finalized before the current recognition instance. The visible answer is
+  // always `committed + current session`, so restarts never lose text.
+  // ---------------------------------------------------------------------------
+  const committedTranscriptRef = useRef("");   // survives recognition restarts
+  const sessionFinalRef = useRef("");          // finalized text of current instance
+  const resultsBaseIndexRef = useRef(0);       // first result index owned by this session
+  const silenceTimerRef = useRef(null);        // pending auto-submit timer
+  const isAiSpeakingRef = useRef(false);       // ref mirror to avoid stale closures
+
+  // A candidate is considered finished when they stop talking for this long.
+  const SILENCE_SUBMIT_MS = 5000;
+  // Guard against auto-submitting a stray cough / filler word.
+  const MIN_AUTO_SUBMIT_CHARS = 10;
+
   useEffect(() => {
     isSubmittingRef.current = isSubmitting;
   }, [isSubmitting]);
+
+  useEffect(() => {
+    isAiSpeakingRef.current = isAiSpeaking;
+  }, [isAiSpeaking]);
+
+  // Fold the current recognition session's finalized speech into the permanent
+  // transcript. Called before any restart so nothing is lost.
+  const commitSessionTranscript = () => {
+    const merged = `${committedTranscriptRef.current} ${sessionFinalRef.current}`
+      .replace(/\s+/g, ' ')
+      .trim();
+    committedTranscriptRef.current = merged;
+    sessionFinalRef.current = "";
+    resultsBaseIndexRef.current = 0;
+    if (merged) {
+      setAnswerText(merged);
+      answerTextRef.current = merged;
+    }
+  };
+
+  // Wipe the transcript when moving to a new question.
+  const resetTranscript = () => {
+    committedTranscriptRef.current = "";
+    sessionFinalRef.current = "";
+    resultsBaseIndexRef.current = 0;
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    setAnswerText("");
+    answerTextRef.current = "";
+  };
 
   // Clean Web Speech API Speech Recognition Initializer & Auto-Restarter
   const startOrRestartSpeechRecognition = () => {
@@ -179,9 +236,14 @@ function CandidatePortal({ directQA = false }) {
         recognitionRef.current.stop();
       } catch (e) {}
       recognitionRef.current = null;
+      // Preserve everything said under the previous instance before it dies.
+      commitSessionTranscript();
     }
 
-    if (window.speechTimeout) clearTimeout(window.speechTimeout);
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
     shouldListenRef.current = true;
 
     try {
@@ -192,36 +254,59 @@ function CandidatePortal({ directQA = false }) {
 
       recognition.onresult = (event) => {
         // If AI is currently actively speaking TTS, skip to prevent echo
-        if (window.isAgentSpeaking && isAiSpeaking) return;
+        if (window.isAgentSpeaking || isAiSpeakingRef.current) return;
 
         isHumanSpeechDetectedRef.current = true;
-        let finalTranscript = '';
+
+        // Rebuild ONLY this instance's results, then prepend everything the
+        // candidate said earlier. `resultsBaseIndexRef` lets us ignore results
+        // already folded into the committed transcript.
+        let sessionFinal = '';
         let interimTranscript = '';
 
-        for (let i = 0; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) {
-            finalTranscript += event.results[i][0].transcript + ' ';
+        for (let i = resultsBaseIndexRef.current; i < event.results.length; ++i) {
+          const result = event.results[i];
+          if (!result || !result[0]) continue;
+          if (result.isFinal) {
+            sessionFinal += result[0].transcript + ' ';
           } else {
-            interimTranscript += event.results[i][0].transcript;
+            interimTranscript += result[0].transcript;
           }
         }
 
-        const fullText = (finalTranscript + interimTranscript).trim();
+        sessionFinalRef.current = sessionFinal.trim();
+
+        // Visible answer = committed history + this session's speech.
+        const fullText = `${committedTranscriptRef.current} ${sessionFinal} ${interimTranscript}`
+          .replace(/\s+/g, ' ')
+          .trim();
+
         if (fullText) {
           setAnswerText(fullText);
           answerTextRef.current = fullText;
         }
 
-        // Extended silence timeout: 12 seconds of complete silence after candidate speaks
-        if (window.speechTimeout) clearTimeout(window.speechTimeout);
-        window.speechTimeout = setTimeout(() => {
+        // 5 seconds of continuous silence => the candidate has finished their
+        // answer, so finalize and advance to the next question. Any new speech
+        // resets this timer, so natural mid-sentence pauses are safe.
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = setTimeout(() => {
+          silenceTimerRef.current = null;
           isHumanSpeechDetectedRef.current = false;
-          if (!isCameraCheckPhaseRef.current && window.submitAnswerFn && answerTextRef.current && answerTextRef.current.trim().length > 15 && !isSubmittingRef.current) {
-            if (!isHardwareMutedRef.current) {
-              window.submitAnswerFn(false);
-            }
+
+          const pending = (answerTextRef.current || '').trim();
+          if (
+            !isCameraCheckPhaseRef.current &&
+            window.submitAnswerFn &&
+            pending.length >= MIN_AUTO_SUBMIT_CHARS &&
+            !isSubmittingRef.current &&
+            !isHardwareMutedRef.current &&
+            !window.isAgentSpeaking &&
+            !isAiSpeakingRef.current
+          ) {
+            window.submitAnswerFn(false);
           }
-        }, 12000);
+        }, SILENCE_SUBMIT_MS);
       };
 
       recognition.onerror = (e) => {
@@ -238,6 +323,11 @@ function CandidatePortal({ directQA = false }) {
       };
 
       recognition.onend = () => {
+        // Restarting resets event.results, so fold this session's speech into
+        // the committed transcript FIRST — otherwise the answer is truncated
+        // to whatever is spoken after the restart.
+        commitSessionTranscript();
+
         if (shouldListenRef.current && streamRef.current && !isSubmittingRef.current && !window.isAgentSpeaking) {
           setTimeout(() => {
             try {
@@ -728,8 +818,8 @@ function CandidatePortal({ directQA = false }) {
   useEffect(() => {
     if (currentQuestion && isCameraCheckCompleted && appState === 'interview') {
       const qText = getQuestionTextString(currentQuestion);
-      answerTextRef.current = "";
-      setAnswerText("");
+      // New question: drop any transcript carried over from the previous answer.
+      resetTranscript();
       window.submitAnswerFn = submitAnswer;
       if (qText) speakText(qText);
     }
@@ -1609,16 +1699,27 @@ function CandidatePortal({ directQA = false }) {
   }, [questionIndex]);
 
   const submitAnswer = async (isTimeout = false) => {
-    if (isSubmitting) return;
+    // Guard on the ref, not state: the 5s silence timer and the countdown timer
+    // can both fire before React flushes `isSubmitting`, causing a double submit
+    // that skips a question.
+    if (isSubmitting || isSubmittingRef.current) return;
     if (isHardwareMutedRef.current) {
       alert("SECURITY WARNING: Your microphone is hardware muted. You cannot proceed until you unmute it.");
       return;
     }
+    isSubmittingRef.current = true;
     setIsSubmitting(true);
     if (timerRef.current) clearInterval(timerRef.current);
-    
-    // Clear speech timeout to prevent double submission
-    if (window.speechTimeout) clearTimeout(window.speechTimeout);
+
+    // Cancel the pending silence auto-submit so it cannot fire twice.
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+
+    // Fold in any speech still held by the live recognition instance so the
+    // final words of the answer are not dropped on submit.
+    commitSessionTranscript();
 
     let submissionText = answerTextRef.current || "";
     if (isTimeout || !submissionText.trim()) {
@@ -1660,8 +1761,7 @@ function CandidatePortal({ directQA = false }) {
         }
         setCurrentQuestion(data.questionText);
         setQuestionIndex(data.questionIndex);
-        setAnswerText("");
-        answerTextRef.current = "";
+        resetTranscript();
         setIsSubmitting(false);
         startQuestionTimer();
       } else {
@@ -1702,8 +1802,7 @@ function CandidatePortal({ directQA = false }) {
       const nextQ = fallbackQuestions[nextIdx % fallbackQuestions.length];
       setCurrentQuestion(nextQ);
       setQuestionIndex(nextIdx);
-      setAnswerText("");
-      answerTextRef.current = "";
+      resetTranscript();
       setIsSubmitting(false);
       startQuestionTimer();
     }
@@ -2305,8 +2404,14 @@ function CandidatePortal({ directQA = false }) {
                     <textarea
                       value={answerText}
                       onChange={(e) => {
+                        // Manual edits become the new committed baseline, so the
+                        // next recognition result appends to the edited text
+                        // instead of reverting it.
                         setAnswerText(e.target.value);
                         answerTextRef.current = e.target.value;
+                        committedTranscriptRef.current = e.target.value;
+                        sessionFinalRef.current = "";
+                        resultsBaseIndexRef.current = 0;
                       }}
                       placeholder={isAiSpeaking ? "Please wait for AI to finish speaking..." : "Speak into your microphone naturally, or type your answer here..."}
                       disabled={isAiSpeaking || isSubmitting}

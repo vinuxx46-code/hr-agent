@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import ReactDOM from 'react-dom';
 import { FaceLandmarker, ObjectDetector, HandLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+import { ViolationTracker, detectGazeAway, detectHeadTurned, countPeople, isFaceOutOfFrame } from '../../proctoring/detection';
 import '../../index.css';
 
 // Suppress verbose MediaPipe WebAssembly logs to clear the console
@@ -148,10 +149,19 @@ function CandidatePortal({ directQA = false }) {
   const recognitionRef = useRef(null);
   const shouldListenRef = useRef(false);
   const isHumanSpeechDetectedRef = useRef(false);
-  const backgroundVoiceCountRef = useRef(0);
-  const headTurnCountRef = useRef(0);
-  const eyesWanderingCountRef = useRef(0);
   const majorPanFramesRef = useRef(0);
+
+  // Time-based violation trackers. The old frame counters assumed ~30 FPS but
+  // the detection loop runs at ~4 FPS, so a "45 frame" threshold silently
+  // required ~11 seconds of uninterrupted violation and rarely ever fired.
+  // These accumulate real elapsed milliseconds, so the thresholds hold no
+  // matter how fast the loop or device is.
+  const gazeTrackerRef = useRef(new ViolationTracker({ requiredMs: 2500, cooldownMs: 8000 }));
+  const headTrackerRef = useRef(new ViolationTracker({ requiredMs: 2500, cooldownMs: 8000 }));
+  const voiceTrackerRef = useRef(new ViolationTracker({ requiredMs: 2000, cooldownMs: 8000 }));
+  const noFaceTrackerRef = useRef(new ViolationTracker({ requiredMs: 2000, cooldownMs: 6000 }));
+  const multiFaceTrackerRef = useRef(new ViolationTracker({ requiredMs: 1200, cooldownMs: 6000 }));
+  const outOfFrameTrackerRef = useRef(new ViolationTracker({ requiredMs: 2000, cooldownMs: 6000 }));
 
   const timerRef = useRef(null);
   const cameraTimerRef = useRef(null);
@@ -161,9 +171,66 @@ function CandidatePortal({ directQA = false }) {
   const ttsSafetyTimeoutRef = useRef(null);
   const isSubmittingRef = useRef(false);
 
+  // ---------------------------------------------------------------------------
+  // VOICE-TO-VOICE TRANSCRIPT STATE (append-only preservation)
+  //
+  // The Web Speech API resets `event.results` every time a SpeechRecognition
+  // instance restarts. Recognition restarts constantly during an interview:
+  // after each `onend`, after network errors, and every time the AI speaks
+  // (we stop the mic to avoid echo). Rebuilding the answer purely from
+  // `event.results` therefore WIPES everything the candidate said before the
+  // most recent restart.
+  //
+  // Fix: keep an append-only `committedTranscriptRef` holding all speech
+  // finalized before the current recognition instance. The visible answer is
+  // always `committed + current session`, so restarts never lose text.
+  // ---------------------------------------------------------------------------
+  const committedTranscriptRef = useRef("");   // survives recognition restarts
+  const sessionFinalRef = useRef("");          // finalized text of current instance
+  const resultsBaseIndexRef = useRef(0);       // first result index owned by this session
+  const silenceTimerRef = useRef(null);        // pending auto-submit timer
+  const isAiSpeakingRef = useRef(false);       // ref mirror to avoid stale closures
+
+  // A candidate is considered finished when they stop talking for this long.
+  const SILENCE_SUBMIT_MS = 5000;
+  // Guard against auto-submitting a stray cough / filler word.
+  const MIN_AUTO_SUBMIT_CHARS = 10;
+
   useEffect(() => {
     isSubmittingRef.current = isSubmitting;
   }, [isSubmitting]);
+
+  useEffect(() => {
+    isAiSpeakingRef.current = isAiSpeaking;
+  }, [isAiSpeaking]);
+
+  // Fold the current recognition session's finalized speech into the permanent
+  // transcript. Called before any restart so nothing is lost.
+  const commitSessionTranscript = () => {
+    const merged = `${committedTranscriptRef.current} ${sessionFinalRef.current}`
+      .replace(/\s+/g, ' ')
+      .trim();
+    committedTranscriptRef.current = merged;
+    sessionFinalRef.current = "";
+    resultsBaseIndexRef.current = 0;
+    if (merged) {
+      setAnswerText(merged);
+      answerTextRef.current = merged;
+    }
+  };
+
+  // Wipe the transcript when moving to a new question.
+  const resetTranscript = () => {
+    committedTranscriptRef.current = "";
+    sessionFinalRef.current = "";
+    resultsBaseIndexRef.current = 0;
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    setAnswerText("");
+    answerTextRef.current = "";
+  };
 
   // Clean Web Speech API Speech Recognition Initializer & Auto-Restarter
   const startOrRestartSpeechRecognition = () => {
@@ -179,9 +246,14 @@ function CandidatePortal({ directQA = false }) {
         recognitionRef.current.stop();
       } catch (e) {}
       recognitionRef.current = null;
+      // Preserve everything said under the previous instance before it dies.
+      commitSessionTranscript();
     }
 
-    if (window.speechTimeout) clearTimeout(window.speechTimeout);
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
     shouldListenRef.current = true;
 
     try {
@@ -192,36 +264,59 @@ function CandidatePortal({ directQA = false }) {
 
       recognition.onresult = (event) => {
         // If AI is currently actively speaking TTS, skip to prevent echo
-        if (window.isAgentSpeaking && isAiSpeaking) return;
+        if (window.isAgentSpeaking || isAiSpeakingRef.current) return;
 
         isHumanSpeechDetectedRef.current = true;
-        let finalTranscript = '';
+
+        // Rebuild ONLY this instance's results, then prepend everything the
+        // candidate said earlier. `resultsBaseIndexRef` lets us ignore results
+        // already folded into the committed transcript.
+        let sessionFinal = '';
         let interimTranscript = '';
 
-        for (let i = 0; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) {
-            finalTranscript += event.results[i][0].transcript + ' ';
+        for (let i = resultsBaseIndexRef.current; i < event.results.length; ++i) {
+          const result = event.results[i];
+          if (!result || !result[0]) continue;
+          if (result.isFinal) {
+            sessionFinal += result[0].transcript + ' ';
           } else {
-            interimTranscript += event.results[i][0].transcript;
+            interimTranscript += result[0].transcript;
           }
         }
 
-        const fullText = (finalTranscript + interimTranscript).trim();
+        sessionFinalRef.current = sessionFinal.trim();
+
+        // Visible answer = committed history + this session's speech.
+        const fullText = `${committedTranscriptRef.current} ${sessionFinal} ${interimTranscript}`
+          .replace(/\s+/g, ' ')
+          .trim();
+
         if (fullText) {
           setAnswerText(fullText);
           answerTextRef.current = fullText;
         }
 
-        // Extended silence timeout: 12 seconds of complete silence after candidate speaks
-        if (window.speechTimeout) clearTimeout(window.speechTimeout);
-        window.speechTimeout = setTimeout(() => {
+        // 5 seconds of continuous silence => the candidate has finished their
+        // answer, so finalize and advance to the next question. Any new speech
+        // resets this timer, so natural mid-sentence pauses are safe.
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = setTimeout(() => {
+          silenceTimerRef.current = null;
           isHumanSpeechDetectedRef.current = false;
-          if (!isCameraCheckPhaseRef.current && window.submitAnswerFn && answerTextRef.current && answerTextRef.current.trim().length > 15 && !isSubmittingRef.current) {
-            if (!isHardwareMutedRef.current) {
-              window.submitAnswerFn(false);
-            }
+
+          const pending = (answerTextRef.current || '').trim();
+          if (
+            !isCameraCheckPhaseRef.current &&
+            window.submitAnswerFn &&
+            pending.length >= MIN_AUTO_SUBMIT_CHARS &&
+            !isSubmittingRef.current &&
+            !isHardwareMutedRef.current &&
+            !window.isAgentSpeaking &&
+            !isAiSpeakingRef.current
+          ) {
+            window.submitAnswerFn(false);
           }
-        }, 12000);
+        }, SILENCE_SUBMIT_MS);
       };
 
       recognition.onerror = (e) => {
@@ -238,6 +333,11 @@ function CandidatePortal({ directQA = false }) {
       };
 
       recognition.onend = () => {
+        // Restarting resets event.results, so fold this session's speech into
+        // the committed transcript FIRST — otherwise the answer is truncated
+        // to whatever is spoken after the restart.
+        commitSessionTranscript();
+
         if (shouldListenRef.current && streamRef.current && !isSubmittingRef.current && !window.isAgentSpeaking) {
           setTimeout(() => {
             try {
@@ -728,8 +828,8 @@ function CandidatePortal({ directQA = false }) {
   useEffect(() => {
     if (currentQuestion && isCameraCheckCompleted && appState === 'interview') {
       const qText = getQuestionTextString(currentQuestion);
-      answerTextRef.current = "";
-      setAnswerText("");
+      // New question: drop any transcript carried over from the previous answer.
+      resetTranscript();
       window.submitAnswerFn = submitAnswer;
       if (qText) speakText(qText);
     }
@@ -982,19 +1082,12 @@ function CandidatePortal({ directQA = false }) {
       let totalPeople = currentFaces;
 
       if (objectResults && objectResults.detections) {
-        const persons = objectResults.detections.filter(d => {
-          const cat = d.categories[0];
-          if (cat.categoryName !== "person") return false;
-          if (cat.score < 0.68) return false; // Ignore low confidence detections (paintings, cartoons)
-          const bbox = d.boundingBox;
-          if (bbox && videoRef.current && videoRef.current.videoWidth) {
-            const normW = bbox.width / videoRef.current.videoWidth;
-            const normH = bbox.height / videoRef.current.videoHeight;
-            if (normW * normH < 0.035) return false; // Ignore small poster drawings
-          }
-          return true;
+        totalPeople = countPeople({
+          faceCount: currentFaces,
+          detections: objectResults.detections,
+          frameWidth: videoRef.current ? videoRef.current.videoWidth : 0,
+          frameHeight: videoRef.current ? videoRef.current.videoHeight : 0,
         });
-        totalPeople = Math.max(currentFaces, persons.length);
 
         const nowObj = performance.now();
         const forbiddenObjects = objectResults.detections.filter(d => ['cell phone', 'laptop', 'book', 'tablet'].includes(d.categories[0].categoryName));
@@ -1011,45 +1104,59 @@ function CandidatePortal({ directQA = false }) {
       }
 
       const now = performance.now();
-      if (now - lastWarningTimeRef.current > 2500) {
-        if (currentHands > 2) {
+
+      // Each condition is evaluated INDEPENDENTLY with its own tracker.
+      // Previously these were an if/else-if chain sharing one cooldown, so a
+      // missing face suppressed multi-person detection entirely and any single
+      // warning silenced every other detector for the cooldown window.
+
+      // Extra hands = someone else reaching into frame.
+      if (currentHands > 2) {
+        if (now - lastWarningTimeRef.current > 2500) {
           hasAdditionalPersonRef.current = true;
           setHasAdditionalPersonDetected(true);
           setWarningsCount(prev => prev + 1);
-          if (isCameraCheckPhaseRef.current) {
-            recordProctoringEvent("360_SCAN_ADDITIONAL_PERSON_DETECTED");
-          } else {
-            recordProctoringEvent("EXTRA_HANDS");
-          }
+          recordProctoringEvent(
+            isCameraCheckPhaseRef.current
+              ? "360_SCAN_ADDITIONAL_PERSON_DETECTED"
+              : "EXTRA_HANDS"
+          );
           lastWarningTimeRef.current = now;
-        } else if (totalPeople === 0) {
-          // During the 360° environment scan phase (isCameraCheckPhaseRef.current = true),
-          // face being absent is EXPECTED and REQUIRED — candidate is rotating camera away.
-          // Do NOT mark as failed when face is gone during scan.
-          if (!isCameraCheckPhaseRef.current) {
-            setWarningsCount(prev => prev + 1);
-            recordProctoringEvent("FACE_NOT_DETECTED");
-            lastWarningTimeRef.current = now;
-          }
-        } else if (totalPeople > 1) {
-          hasAdditionalPersonRef.current = true;
-          setHasAdditionalPersonDetected(true);
-          setWarningsCount(prev => prev + 1);
-          if (isCameraCheckPhaseRef.current) {
-            recordProctoringEvent("360_SCAN_ADDITIONAL_PERSON_DETECTED");
-          } else {
-            recordProctoringEvent("MULTIPLE_FACES");
-          }
-          lastWarningTimeRef.current = now;
-        } else if (results.faceLandmarks && results.faceLandmarks.length > 0) {
-          // Basic out of frame check (nose too close to extreme edges)
-          const nose = results.faceLandmarks[0][1];
-          if (nose.x < 0.03 || nose.x > 0.97 || nose.y < 0.03 || nose.y > 0.97) {
-            setWarningsCount(prev => prev + 1);
-            recordProctoringEvent("FACE_OUT_OF_FRAME");
-            lastWarningTimeRef.current = now;
-          }
         }
+      }
+
+      // Candidate absent. During the 360 scan the face is EXPECTED to leave
+      // frame, so this is only enforced during the interview itself.
+      const faceMissing = totalPeople === 0 && !isCameraCheckPhaseRef.current;
+      if (noFaceTrackerRef.current.update(faceMissing, now)) {
+        setWarningsCount(prev => prev + 1);
+        recordProctoringEvent("FACE_NOT_DETECTED");
+      }
+
+      // More than one person in frame.
+      if (multiFaceTrackerRef.current.update(totalPeople > 1, now)) {
+        hasAdditionalPersonRef.current = true;
+        setHasAdditionalPersonDetected(true);
+        setWarningsCount(prev => prev + 1);
+        recordProctoringEvent(
+          isCameraCheckPhaseRef.current
+            ? "360_SCAN_ADDITIONAL_PERSON_DETECTED"
+            : "MULTIPLE_FACES"
+        );
+      }
+
+      // Candidate drifting out of the camera frame.
+      const primaryFace =
+        results.faceLandmarks && results.faceLandmarks.length > 0
+          ? results.faceLandmarks[0]
+          : null;
+      const outOfFrame =
+        !isCameraCheckPhaseRef.current &&
+        totalPeople === 1 &&
+        isFaceOutOfFrame(primaryFace);
+      if (outOfFrameTrackerRef.current.update(outOfFrame, now)) {
+        setWarningsCount(prev => prev + 1);
+        recordProctoringEvent("FACE_OUT_OF_FRAME");
       }
 
       // BACKGROUND VOICE DETECTION - Noise-Ignoring Implementation
@@ -1083,6 +1190,7 @@ function CandidatePortal({ directQA = false }) {
       }
 
       let isMouthMoving = false;
+      let isEyesWandering = false;
       if (results.faceBlendshapes && results.faceBlendshapes.length > 0) {
         const shapes = results.faceBlendshapes[0].categories;
         const jawOpen = shapes.find(c => c.categoryName === 'jawOpen');
@@ -1091,115 +1199,63 @@ function CandidatePortal({ directQA = false }) {
           isMouthMoving = true;
         }
 
-        // ENTERPRISE CALIBRATED DUAL-MODE EYE TRACKING (Blendshapes + Dual Iris Pupil Landmarks)
-        // Calibrated thresholds: blendshape 0.82 instead of 0.75 to reduce false positives while reading
-        // Iris: dual-eye check with 0.18-0.82 horizontal and 0.15-0.85 vertical calibration
+        // Gaze tracking. Blendshapes are a fast first signal; the iris
+        // geometry check in detectGazeAway() then confirms it, requiring BOTH
+        // eyes to agree so single-eye landmark jitter cannot cause a warning.
         const eyeKeys = ['eyeLookInLeft', 'eyeLookOutLeft', 'eyeLookUpLeft', 'eyeLookDownLeft', 'eyeLookInRight', 'eyeLookOutRight', 'eyeLookUpRight', 'eyeLookDownRight'];
-        let isEyesWandering = eyeKeys.some(key => {
+        const blendshapeSuggestsAway = eyeKeys.some(key => {
           const shape = shapes.find(c => c.categoryName === key);
-          return shape && shape.score > 0.82; // Calibrated 0.82 gaze threshold - only true off-screen gaze triggers, reading is ignored
+          return shape && shape.score > 0.82;
         });
 
-        // Calibrated Iris Pupil Landmark Tracking - Dual Eye + Vertical
-        if (!isEyesWandering && results.faceLandmarks && results.faceLandmarks.length > 0) {
-          const landmarks = results.faceLandmarks[0];
-          if (landmarks && landmarks.length > 473) {
-            const checkEye = (pupilIdx, innerIdx, outerIdx, topIdx, bottomIdx) => {
-              const pupil = landmarks[pupilIdx];
-              const inner = landmarks[innerIdx];
-              const outer = landmarks[outerIdx];
-              if (!pupil || !inner || !outer) return false;
-              const eyeWidth = Math.abs(outer.x - inner.x);
-              if (eyeWidth < 0.01) return false;
-              const hRatio = Math.abs(pupil.x - inner.x) / eyeWidth;
-              // Calibrated horizontal: <0.18 or >0.82 = true off-screen, 0.18-0.82 = normal reading range
-              if (hRatio < 0.18 || hRatio > 0.82) return true;
-              // Calibrated vertical check
-              if (topIdx && bottomIdx) {
-                const top = landmarks[topIdx];
-                const bottom = landmarks[bottomIdx];
-                if (top && bottom) {
-                  const eyeHeight = Math.abs(bottom.y - top.y);
-                  if (eyeHeight > 0.001) {
-                    const vRatio = (pupil.y - top.y) / eyeHeight;
-                    if (vRatio < 0.15 || vRatio > 0.85) return true;
-                  }
-                }
-              }
-              return false;
-            };
-            // Left eye: 468 pupil, 133 inner, 33 outer, 159 top, 145 bottom
-            // Right eye: 473 pupil, 362 inner, 263 outer, 386 top, 374 bottom
-            if (checkEye(468, 133, 33, 159, 145) || checkEye(473, 362, 263, 386, 374)) {
-              isEyesWandering = true;
-            }
-          }
-        }
+        const primaryLandmarks =
+          results.faceLandmarks && results.faceLandmarks.length > 0
+            ? results.faceLandmarks[0]
+            : null;
+        const gaze = detectGazeAway(primaryLandmarks);
 
-        if (isEyesWandering) {
-          eyesWanderingCountRef.current += 1;
-        } else {
-          eyesWanderingCountRef.current = Math.max(0, eyesWanderingCountRef.current - 3); // Quick decay on natural gaze
-        }
+        // Blendshapes alone are noisy, so require geometric confirmation
+        // unless the blendshape signal is unavailable.
+        isEyesWandering = gaze.away || (blendshapeSuggestsAway && gaze.reason === 'no-landmarks');
       }
 
-      // HIGH-PRECISION HEAD TURN TRACKING
+      // HEAD POSE TRACKING (yaw + pitch)
       let isHeadTurned = false;
-      if (results.faceLandmarks && results.faceLandmarks.length > 0) {
-        // Head tracking based on relative position of nose to ears
-        const nose = results.faceLandmarks[0][1];
-        const leftEar = results.faceLandmarks[0][234];
-        const rightEar = results.faceLandmarks[0][454];
-
-        if (nose && leftEar && rightEar) {
-          const distLeft = Math.abs(nose.x - leftEar.x);
-          const distRight = Math.abs(nose.x - rightEar.x);
-          // Head turn ratio (detects turning head completely away from monitor > 2.2)
-          if (distLeft / distRight > 2.2 || distRight / distLeft > 2.2) {
-            isHeadTurned = true;
-          }
+      {
+        const primaryLandmarks =
+          results.faceLandmarks && results.faceLandmarks.length > 0
+            ? results.faceLandmarks[0]
+            : null;
+        if (primaryLandmarks) {
+          isHeadTurned = detectHeadTurned(primaryLandmarks).turned;
         }
       }
 
-      if (isHeadTurned) {
-        headTurnCountRef.current += 1;
-      } else {
-        headTurnCountRef.current = Math.max(0, headTurnCountRef.current - 3);
-      }
-
-      // Noise-filtered: only confirmed human voice (SpeechRecognition) triggers background voice, not ambient noise
-      if (isConfirmedHumanVoice && !isMouthMoving && !window.isAgentSpeaking) {
-        backgroundVoiceCountRef.current += 1;
-      } else {
-        backgroundVoiceCountRef.current = Math.max(0, backgroundVoiceCountRef.current - 3); // Faster decay to ignore transient noise
-      }
-
-      // Require sustained confirmed speech (approx 2 seconds) to trigger, ignoring pure noise
-      if (backgroundVoiceCountRef.current > 28 && now - lastWarningTimeRef.current > 7000) {
+      // Background voice: only confirmed human speech counts, never ambient
+      // noise (fans, AC, typing, traffic).
+      const backgroundVoice = isConfirmedHumanVoice && !isMouthMoving && !window.isAgentSpeaking;
+      if (voiceTrackerRef.current.update(backgroundVoice, now)) {
         if (isCameraCheckPhaseRef.current) {
           isPreCheckFailedRef.current = "Environment scan failed: Background voices detected. You must be in a quiet environment.";
         } else {
           setWarningsCount(prev => prev + 1);
           recordProctoringEvent("BACKGROUND_VOICE");
-          lastWarningTimeRef.current = now;
-          backgroundVoiceCountRef.current = 0;
         }
       }
 
-      // Flag wandering eyes (Sustained off-screen gaze deviation > 45 frames, 5s cooldown)
-      if (eyesWanderingCountRef.current > 45 && now - lastWarningTimeRef.current > 5000) {
-        setWarningsCount(prev => prev + 1);
-        recordProctoringEvent("EYES_WANDERING");
-        lastWarningTimeRef.current = now;
-        eyesWanderingCountRef.current = 0;
-      }
+      // Gaze and head pose. Each tracker owns its own cooldown, so a head turn
+      // no longer suppresses an unrelated gaze warning (they previously shared
+      // a single lastWarningTimeRef and masked one another).
+      if (!isCameraCheckPhaseRef.current) {
+        if (gazeTrackerRef.current.update(isEyesWandering, now)) {
+          setWarningsCount(prev => prev + 1);
+          recordProctoringEvent("EYES_WANDERING");
+        }
 
-      // Flag head turn (Sustained off-screen head turn > 45 frames, 5s cooldown)
-      if (headTurnCountRef.current > 45 && now - lastWarningTimeRef.current > 5000) {
-        setWarningsCount(prev => prev + 1);
-        recordProctoringEvent("HEAD_TURNED");
-        lastWarningTimeRef.current = now;
-        headTurnCountRef.current = 0;
+        if (headTrackerRef.current.update(isHeadTurned, now)) {
+          setWarningsCount(prev => prev + 1);
+          recordProctoringEvent("HEAD_TURNED");
+        }
       }
     }
 
@@ -1366,7 +1422,9 @@ function CandidatePortal({ directQA = false }) {
     if (isFirstQuestionStartedRef.current !== undefined) isFirstQuestionStartedRef.current = false;
     setWarningsCount(0);
     proctoringEvents.current = [];
-    backgroundVoiceCountRef.current = 0;
+    [gazeTrackerRef, headTrackerRef, voiceTrackerRef,
+     noFaceTrackerRef, multiFaceTrackerRef, outOfFrameTrackerRef]
+      .forEach(ref => ref.current.reset());
     setShowCamera(true);
   };
 
@@ -1609,16 +1667,27 @@ function CandidatePortal({ directQA = false }) {
   }, [questionIndex]);
 
   const submitAnswer = async (isTimeout = false) => {
-    if (isSubmitting) return;
+    // Guard on the ref, not state: the 5s silence timer and the countdown timer
+    // can both fire before React flushes `isSubmitting`, causing a double submit
+    // that skips a question.
+    if (isSubmitting || isSubmittingRef.current) return;
     if (isHardwareMutedRef.current) {
       alert("SECURITY WARNING: Your microphone is hardware muted. You cannot proceed until you unmute it.");
       return;
     }
+    isSubmittingRef.current = true;
     setIsSubmitting(true);
     if (timerRef.current) clearInterval(timerRef.current);
-    
-    // Clear speech timeout to prevent double submission
-    if (window.speechTimeout) clearTimeout(window.speechTimeout);
+
+    // Cancel the pending silence auto-submit so it cannot fire twice.
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+
+    // Fold in any speech still held by the live recognition instance so the
+    // final words of the answer are not dropped on submit.
+    commitSessionTranscript();
 
     let submissionText = answerTextRef.current || "";
     if (isTimeout || !submissionText.trim()) {
@@ -1660,8 +1729,7 @@ function CandidatePortal({ directQA = false }) {
         }
         setCurrentQuestion(data.questionText);
         setQuestionIndex(data.questionIndex);
-        setAnswerText("");
-        answerTextRef.current = "";
+        resetTranscript();
         setIsSubmitting(false);
         startQuestionTimer();
       } else {
@@ -1702,8 +1770,7 @@ function CandidatePortal({ directQA = false }) {
       const nextQ = fallbackQuestions[nextIdx % fallbackQuestions.length];
       setCurrentQuestion(nextQ);
       setQuestionIndex(nextIdx);
-      setAnswerText("");
-      answerTextRef.current = "";
+      resetTranscript();
       setIsSubmitting(false);
       startQuestionTimer();
     }
@@ -2305,8 +2372,14 @@ function CandidatePortal({ directQA = false }) {
                     <textarea
                       value={answerText}
                       onChange={(e) => {
+                        // Manual edits become the new committed baseline, so the
+                        // next recognition result appends to the edited text
+                        // instead of reverting it.
                         setAnswerText(e.target.value);
                         answerTextRef.current = e.target.value;
+                        committedTranscriptRef.current = e.target.value;
+                        sessionFinalRef.current = "";
+                        resultsBaseIndexRef.current = 0;
                       }}
                       placeholder={isAiSpeaking ? "Please wait for AI to finish speaking..." : "Speak into your microphone naturally, or type your answer here..."}
                       disabled={isAiSpeaking || isSubmitting}

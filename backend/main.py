@@ -1,8 +1,8 @@
 import os
 import json
-from fastapi import FastAPI, UploadFile, File, Form, Request, Body
+from fastapi import FastAPI, UploadFile, File, Form, Request, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from google import genai
 import PyPDF2
@@ -19,6 +19,19 @@ import zipfile
 import io
 import asyncio
 import time
+
+import security
+from security import (
+    require_hr_auth,
+    validate_token,
+    validate_resume_upload,
+    validate_archive,
+    safe_archive_members,
+    validate_video_upload,
+    sanitize_proctoring_events,
+    rate_limit,
+    safe_filename,
+)
 
 # Load environment variables from backend/.env and root .env
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
@@ -146,14 +159,31 @@ app = FastAPI()
 os.makedirs("recordings", exist_ok=True)
 app.mount("/recordings", StaticFiles(directory="recordings"), name="recordings")
 
-# Allow CORS for the frontend
+# CORS is restricted to an explicit allow-list. `allow_origins=["*"]` let any
+# site on the internet call the API from a victim's browser and read candidate
+# PII, so it is no longer used. Configure ALLOWED_ORIGINS for production.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=security.allowed_origins(),
+    allow_origin_regex=security.allowed_origin_regex(),
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-HR-Key"],
 )
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Baseline hardening headers on every response."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
+    # Candidate PII must never be cached by intermediaries.
+    if request.url.path.startswith("/api/hr") or "/api/validate-token" in request.url.path:
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 def get_genai_client():
     # Dynamic env reload from backend/.env and root/.env
@@ -322,30 +352,44 @@ async def process_single_resume(content: bytes, filename: str):
             return {"error": f"Failed: {str(e)}", "filename": filename}
 
 @app.post("/api/bulk-upload")
-async def bulk_upload_resume(file: UploadFile = File(...)):
-    if not file.filename.endswith('.zip'):
+async def bulk_upload_resume(request: Request, file: UploadFile = File(...)):
+    require_hr_auth(request)
+    rate_limit(request, "bulk-upload", limit=5, window_seconds=60)
+
+    if not safe_filename(file.filename).lower().endswith('.zip'):
         return {"error": "Must be a .zip file"}
-    
+
     content = await file.read()
+    validate_archive(content)
     results = []
-    
-    with zipfile.ZipFile(io.BytesIO(content)) as z:
-        for filename in z.namelist():
-            if filename.endswith(('.pdf', '.doc', '.docx')) and not filename.startswith('__MACOSX'):
-                file_content = z.read(filename)
-                # Process synchronously to avoid rate limits, or use asyncio.gather for parallel
-                res = await process_single_resume(file_content, filename)
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as z:
+            # Rejects zip-slip paths and archives that expand to gigabytes.
+            for info in safe_archive_members(z):
+                file_content = z.read(info)
+                if len(file_content) > security.MAX_RESUME_BYTES:
+                    continue
+                res = await process_single_resume(file_content, safe_filename(info.filename))
                 results.append(res)
-                
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid zip archive.")
+
     return {"isBulk": True, "candidates": results}
 
 
 @app.post("/api/upload-resume")
-async def upload_resume(resume: UploadFile = File(...)):
+async def upload_resume(request: Request, resume: UploadFile = File(...)):
+    rate_limit(request, "upload-resume", limit=20, window_seconds=60)
+
+    # Validate BEFORE the try block. The broad handler below falls back to the
+    # offline engine on any exception, which would otherwise swallow a
+    # rejection and return 200 for a disallowed file type.
+    content = await resume.read()
+    validate_resume_upload(resume.filename, content)
+    filename = safe_filename(resume.filename).lower()
+
     try:
-        # Read the file content and parse based on extension
-        content = await resume.read()
-        filename = resume.filename.lower()
 
         # Load rejected resumes and prepare identifiers for cooldown tracking
         rejected_resumes = load_rejected_resumes()
@@ -555,14 +599,16 @@ class InterviewStartRequest(BaseModel):
     token: Optional[str] = None
 
 class InterviewAnswerRequest(BaseModel):
-    sessionId: str
-    questionIndex: int
-    answer: str
-    proctoringEvents: List[dict] = []
+    # Bounded so a crafted client cannot push an unbounded payload into the
+    # AI prompt or the JSON store.
+    sessionId: str = Field(max_length=128)
+    questionIndex: int = Field(ge=0, le=200)
+    answer: str = Field(default="", max_length=20000)
+    proctoringEvents: List[dict] = Field(default_factory=list, max_length=2000)
 
 class InterviewFinishRequest(BaseModel):
-    sessionId: str
-    proctoringEvents: List[dict] = []
+    sessionId: str = Field(max_length=128)
+    proctoringEvents: List[dict] = Field(default_factory=list, max_length=5000)
 
 @app.post("/api/interview/start")
 async def start_interview(request: InterviewStartRequest):
@@ -821,7 +867,7 @@ async def submit_answer(request: InterviewAnswerRequest):
         print(f"Timer validation failed. Time taken: {time_taken}s")
         request.answer = "[TIME EXPIRED]"
         
-    session["proctoringEvents"].extend(request.proctoringEvents)
+    session["proctoringEvents"].extend(sanitize_proctoring_events(request.proctoringEvents))
     
     question_data = session["questions"][request.questionIndex]
     question_text = question_data.get("question", str(question_data)) if isinstance(question_data, dict) else str(question_data)
@@ -867,7 +913,7 @@ async def finish_interview(request: InterviewFinishRequest):
     if not session:
         return {"error": "Session not found"}
         
-    session["proctoringEvents"].extend(request.proctoringEvents)
+    session["proctoringEvents"].extend(sanitize_proctoring_events(request.proctoringEvents))
     session["status"] = "completed"
     
     total_marks = len(session["questions"])
@@ -984,24 +1030,30 @@ Summary: {final_summary}
     return report
 
 @app.get("/api/candidates")
-async def get_candidates():
+async def get_candidates(request: Request):
+    require_hr_auth(request)
     # Return completed interviews for HR dashboard
     return {"candidates": COMPLETED_INTERVIEWS}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host=os.getenv("API_HOST", "127.0.0.1"), port=int(os.getenv("API_PORT", "8000")))
 
 
 @app.get("/api/hr/candidates")
-async def get_all_hr_candidates():
+async def get_all_hr_candidates(request: Request):
+    # Returns every candidate's name, email and evaluation - HR only.
+    require_hr_auth(request)
     db = load_hr_db()
     candidates = list(db.get("candidates", {}).values())
     candidates.sort(key=lambda x: x.get("invited_at", ""), reverse=True)
     return {"status": "success", "candidates": candidates}
 
 @app.post("/api/hr/send-invites")
-async def send_hr_invites(data: dict):
+async def send_hr_invites(data: dict, request: Request):
+    # Sends interview emails; unauthenticated access allowed spam/abuse.
+    require_hr_auth(request)
+    rate_limit(request, "send-invites", limit=10, window_seconds=60)
     # Receives { "candidates": [{"email": "...", "filename": "...", ...}], "expiry_hours": 48 }
     db = load_hr_db()
     expiry_hours = data.get("expiry_hours", 48)
@@ -1057,7 +1109,10 @@ async def send_hr_invites(data: dict):
     return {"status": "success", "invited_count": len(invited), "invited": invited}
 
 @app.get("/api/validate-token/{token}")
-async def validate_token(token: str):
+async def validate_invite_token(token: str, request: Request):
+    # Rate limited to stop brute-force enumeration of interview links.
+    rate_limit(request, "validate-token", limit=30, window_seconds=60)
+    validate_token(token)
     db = load_hr_db()
     if token not in db["candidates"]:
         return {"valid": False, "reason": "Invalid token."}
@@ -1086,6 +1141,8 @@ async def validate_token(token: str):
 
 @app.post("/api/verify-360-scan/{token}")
 async def verify_360_scan(token: str, request: Request):
+    validate_token(token)
+    rate_limit(request, "verify-360", limit=20, window_seconds=60)
     db = load_hr_db()
     if token in db["candidates"]:
         db["candidates"][token]["scan_360_verified"] = True
@@ -1093,7 +1150,7 @@ async def verify_360_scan(token: str, request: Request):
         
         try:
             body = await request.json()
-            events = body.get("proctoringEvents", [])
+            events = sanitize_proctoring_events(body.get("proctoringEvents", []))
             if events and isinstance(events, list):
                 if "proctoring_logs" not in db["candidates"][token] or not isinstance(db["candidates"][token]["proctoring_logs"], list):
                     db["candidates"][token]["proctoring_logs"] = []
@@ -1109,7 +1166,17 @@ async def verify_360_scan(token: str, request: Request):
     return {"success": False, "error": "Token not found"}
 
 @app.post("/api/log-proctoring-event/{token}")
-async def log_proctoring_event(token: str, event: dict = Body(...)):
+async def log_proctoring_event(token: str, request: Request, event: dict = Body(...)):
+    validate_token(token)
+    # Proctoring events stream in continuously, so the ceiling is generous but
+    # still bounded to stop the JSON store being flooded.
+    rate_limit(request, "proctor-log", limit=240, window_seconds=60)
+
+    cleaned = sanitize_proctoring_events([event])
+    if not cleaned:
+        return {"success": False, "error": "Unrecognised event type"}
+    event = cleaned[0]
+
     db = load_hr_db()
     if token in db["candidates"]:
         candidate = db["candidates"][token]
@@ -1125,6 +1192,7 @@ async def log_proctoring_event(token: str, event: dict = Body(...)):
 
 @app.get("/api/check-360-verification/{token}")
 async def check_360_verification(token: str):
+    validate_token(token)
     db = load_hr_db()
     if token in db["candidates"]:
         is_verified = db["candidates"][token].get("scan_360_verified", False)
@@ -1133,6 +1201,7 @@ async def check_360_verification(token: str):
 
 @app.post("/api/expire-token/{token}")
 async def expire_token(token: str):
+    validate_token(token)
     db = load_hr_db()
     if token in db["candidates"]:
         db["candidates"][token]["status"] = "EXPIRED"
@@ -1520,7 +1589,11 @@ This report was automatically generated by AI Agent Recruiter."""
             print(f"[HR EMAIL ERROR] Failed to send email: {e}")
 
 @app.post("/api/upload-interview-data/{token}")
-async def upload_interview_data(token: str, video: UploadFile = File(None), proctoring_logs: str = Form("{}")):
+async def upload_interview_data(token: str, request: Request, video: UploadFile = File(None), proctoring_logs: str = Form("{}")):
+    # The token is interpolated into a filesystem path below, so it must be
+    # validated before use or "../../" would escape the recordings directory.
+    validate_token(token)
+    rate_limit(request, "upload-interview", limit=10, window_seconds=60)
     db = load_hr_db()
     if token not in db["candidates"]:
         return {"error": "Invalid token"}
@@ -1533,21 +1606,29 @@ async def upload_interview_data(token: str, video: UploadFile = File(None), proc
     # Save video if exists
     if video:
         os.makedirs("recordings", exist_ok=True)
-        video_path = f"recordings/{token}.webm"
         content = await video.read()
+        validate_video_upload(content)
+        # token is a validated UUID, so this path cannot escape recordings/.
+        video_path = os.path.join("recordings", f"{token}.webm")
         with open(video_path, "wb") as f:
             f.write(content)
         candidate["recording_link"] = video_path
-        
-    # Save proctoring logs
-    candidate["proctoring_logs"] = json.loads(proctoring_logs)
+
+    # Save proctoring logs (untrusted client input)
+    try:
+        parsed_logs = json.loads(proctoring_logs) if proctoring_logs else []
+    except json.JSONDecodeError:
+        parsed_logs = []
+    candidate["proctoring_logs"] = sanitize_proctoring_events(parsed_logs)
     
     save_hr_db(db)
     send_hr_completed_report(candidate)
     return {"status": "success"}
 
 @app.get("/api/hr/dashboard-data")
-async def get_dashboard_data():
+async def get_dashboard_data(request: Request):
+    # Full database dump - HR only.
+    require_hr_auth(request)
     return load_hr_db()
 
 @app.post("/api/interview/evaluate")
@@ -1572,19 +1653,24 @@ async def evaluate_interview(data: dict):
     return evaluation_result
 
 @app.post("/api/hr/send-email/{token}")
-async def send_candidate_email_report(token: str):
+async def send_candidate_email_report(token: str, request: Request):
+    require_hr_auth(request)
+    validate_token(token)
+    rate_limit(request, "send-email", limit=20, window_seconds=60)
     db = load_hr_db()
     if token not in db["candidates"]:
         return {"success": False, "error": "Candidate token not found"}
     candidate = db["candidates"][token]
     send_hr_completed_report(candidate)
-    hr_email = candidate.get("hr_email") or os.getenv("HR_EMAIL") or os.getenv("SMTP_USER") or "vinuxx46@gmail.com"
+    hr_email = candidate.get("hr_email") or os.getenv("HR_EMAIL") or os.getenv("SMTP_USER") or "hr@company.com"
     return {"success": True, "message": f"Report successfully emailed to {hr_email}"}
 
 from fastapi.responses import FileResponse
 
 @app.get("/api/hr/download-pdf/{token}")
-async def download_candidate_pdf_report(token: str):
+async def download_candidate_pdf_report(token: str, request: Request):
+    require_hr_auth(request)
+    validate_token(token)
     db = load_hr_db()
     if token not in db["candidates"]:
         return {"error": "Token not found"}

@@ -9,3 +9,27 @@ temp_resumes/
 resume/
 backend/.env
 backend\__pycache__ copy/
+# --- Candidate PII and generated artifacts (never commit) ---
+# These contain real names, emails, resumes and interview recordings.
+backend/recordings/
+backend/reports/
+backend/temp_resumes/
+backend/hr_inbox/
+backend/hr_database.json
+backend/data/hr_database.json
+backend/data/rejected_resumes.json
+backend/data/resume_analysis_results.json
+backend/api/data/
+rejected_resumes.json
+resume_analysis_results.json
+infini_boys_resume/
+infini_boys_resume.zip
+*.webm
+
+# Stale duplicated working directories
+*" copy"/
+**/*\ copy/
+__pycache__/
+*.pyc
+.venv-test/
+frontend/dist/
